@@ -229,12 +229,33 @@ const DNSView = ({ config }: { config: AppConfig | null }) => {
   const [selectedDomain, setSelectedDomain] = useState<string>('');
   const [newRecord, setNewRecord] = useState({ name: '', content: config?.vpsIp || '', type: 'A', proxied: config?.cfProxied || false, domain: '' });
 
-  // 初始化选择第一个域名
+  const [availableZones, setAvailableZones] = useState<{id: string, name: string}[]>([]);
+  const [isFallbackMode, setIsFallbackMode] = useState(false);
+  const [zonesLoaded, setZonesLoaded] = useState(false);
+
+  // 初始化获取可用域名
   useEffect(() => {
-    if (config?.allowedDomains && config.allowedDomains.length > 0) {
-      setSelectedDomain(config.allowedDomains[0]);
+    if (config?.hasCfToken) {
+      const fetchZones = async () => {
+        try {
+          const res = await apiFetch('/api/dns/zones');
+          const data = await res.json();
+          if (res.ok) {
+            setAvailableZones(data.zones || []);
+            setIsFallbackMode(data.isFallbackMode || false);
+            if (data.zones && data.zones.length > 0) {
+              setSelectedDomain(data.zones[0].name);
+            }
+          }
+        } catch (e) {
+          console.error("Failed to fetch zones", e);
+        } finally {
+          setZonesLoaded(true);
+        }
+      };
+      fetchZones();
     }
-  }, [config]);
+  }, [config?.hasCfToken]);
 
   // 获取指定域名的 DNS 记录
   const fetchRecords = async () => {
@@ -325,18 +346,31 @@ const DNSView = ({ config }: { config: AppConfig | null }) => {
 
   return (
     <div className="space-y-6">
+      {isFallbackMode && (
+        <div className="p-4 bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 rounded-xl flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+          <div>
+            <h4 className="text-sm font-medium text-amber-800 dark:text-amber-400">降级告警：未获取到完整 Zone 读取权限</h4>
+            <p className="text-sm text-amber-700 dark:text-amber-500/80 mt-1">
+              当前 Token 缺乏全局的 Zone:Read 权限，系统已被迫退回兜底模式，域名列表仅使用 ALLOWED_DOMAINS 呈现。后台使用的是强绑定的 CF_ZONE_ID，若下拉选择了其他无关域名操作，将会引发 403 / 404 错误。请务必确认操作范围一致。
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold text-slate-900 dark:text-white">DNS 代理模块</h2>
         <div className="flex items-center gap-3">
           {/* 域名选择器 */}
-          {config?.allowedDomains && config.allowedDomains.length > 0 && (
+          {availableZones && availableZones.length > 0 && (
             <select 
               value={selectedDomain}
               onChange={(e) => setSelectedDomain(e.target.value)}
-              className="px-4 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+              className={cn("px-4 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none", availableZones.length <= 1 && "bg-slate-50 dark:bg-slate-900 text-slate-500 cursor-not-allowed")}
+              disabled={availableZones.length <= 1}
             >
-              {config.allowedDomains.map(d => (
-                <option key={d} value={d}>{d}</option>
+              {availableZones.map(z => (
+                <option key={z.name} value={z.name}>{z.name}</option>
               ))}
             </select>
           )}

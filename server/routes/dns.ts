@@ -1,8 +1,21 @@
 import { Router } from "express";
-import { getDnsRecords, createDnsRecord, updateDnsRecord, deleteDnsRecord } from "../services/cloudflare";
+import { getAvailableZones, getDnsRecords, createDnsRecord, updateDnsRecord, deleteDnsRecord } from "../services/cloudflare";
 import { CONFIG } from "../utils/config";
 
 const router = Router();
+
+router.get("/zones", async (req, res) => {
+  if (!CONFIG.CF_API_TOKEN) {
+    return res.status(400).json({ error: "未在 .env 中配置 Cloudflare API Token" });
+  }
+  
+  try {
+    const data = await getAvailableZones();
+    res.json(data);
+  } catch (error: any) {
+    res.status(500).json({ error: "获取可用 Zones 列表失败", details: error.message });
+  }
+});
 
 router.get("/records", async (req, res) => {
   if (!CONFIG.CF_API_TOKEN) {
