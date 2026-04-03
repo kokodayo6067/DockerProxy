@@ -8,6 +8,7 @@ import yaml from "js-yaml";
 import { NodeSSH } from "node-ssh";
 import { CONFIG } from "../utils/config";
 import { docker } from "./docker";
+import { getEnvironment, getEnvironmentConnection, getLocalEnvironmentId } from "./platform";
 
 const execAsync = promisify(execCallback);
 const migrationBus = new EventEmitter();
@@ -49,10 +50,12 @@ export interface TargetHostInput {
 interface PlanInput {
   projectPath: string;
   rootService: string;
-  targetHost: TargetHostInput;
+  sourceEnvironmentId?: string;
+  targetEnvironmentId: string;
 }
 
 interface MigrationProjectSource {
+  environmentId: string;
   name: string;
   path: string;
   projectDir: string;
@@ -64,6 +67,9 @@ interface MigrationProjectSource {
   planningMode: "compose-file" | "runtime-snapshot";
   description: string;
   runningContainerCount: number;
+  warning?: string;
+  remoteProjectDir?: string;
+  remoteComposePath?: string;
 }
 
 interface MigrationRisk {
@@ -212,6 +218,8 @@ export interface MigrationSession {
   projectName: string;
   projectPath: string;
   composePath: string;
+  sourceEnvironmentId: string;
+  targetEnvironmentId: string;
   rootService: string;
   dependencyServices: string[];
   selectedServices: string[];
@@ -248,12 +256,18 @@ export interface MigrationSession {
     remoteArtifactsDir: string;
     remoteComposePath: string;
     remoteCutoverComposePath: string;
+    remoteProjectArchivePath?: string;
     localSessionDir: string;
     localArtifactsDir: string;
     localProjectDir: string;
+    localProjectArchivePath?: string;
     localComposePath: string;
     localProjectBytes: number;
     localFileManifest: Array<{ path: string; size: number }>;
+    sourceProjectCached?: boolean;
+    sourceRemoteProjectDir?: string;
+    sourceRemoteComposePath?: string;
+    sourceWorkdir?: string;
     namedVolumeArchives: Array<{
       sourceVolume: string;
       stagingVolume: string;
@@ -315,6 +329,10 @@ function migrationRoot() {
 
 function runtimeSnapshotRoot() {
   return path.join(migrationRoot(), "runtime-snapshots");
+}
+
+function runtimeSnapshotRootForEnvironment(environmentId: string) {
+  return environmentId === getLocalEnvironmentId() ? runtimeSnapshotRoot() : path.join(runtimeSnapshotRoot(), sanitizeName(environmentId));
 }
 
 function nowIso() {
@@ -394,6 +412,41 @@ function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
 }
 
+function getTargetHostFromEnvironment(environmentId: string): TargetHostInput {
+  const { environment, credential } = getEnvironmentConnection(environmentId);
+  if (environment.is_local === 1) {
+    throw new Error("迁移目标环境不能使用当前宿主机");
+  }
+  return {
+    host: environment.host || "",
+    port: environment.port || 22,
+    username: environment.username || "",
+    password: credential?.password,
+    privateKey: credential?.privateKey,
+  };
+}
+
+async function getSourceEnvironmentConnection(environmentId: string) {
+  if (isLocalEnvironment(environmentId)) {
+    throw new Error("当前宿主机不需要 SSH 连接");
+  }
+  const { environment, credential } = getEnvironmentConnection(environmentId);
+  const ssh = new NodeSSH();
+  await ssh.connect({
+    host: environment.host || "",
+    port: environment.port || 22,
+    username: environment.username || "",
+    password: credential?.password,
+    privateKey: credential?.privateKey,
+    hostHash: "sha256",
+    hostVerifier: (hashedKey) => {
+      if (!environment.host_fingerprint) return true;
+      return hashedKey === environment.host_fingerprint;
+    },
+  });
+  return { ssh, environment, credential };
+}
+
 function toArray<T>(value: T | T[] | undefined | null): T[] {
   if (value == null) return [];
   return Array.isArray(value) ? value : [value];
@@ -401,6 +454,10 @@ function toArray<T>(value: T | T[] | undefined | null): T[] {
 
 function sanitizeName(value: string) {
   return value.replace(/[^a-zA-Z0-9_.-]/g, "-");
+}
+
+function isLocalEnvironment(environmentId: string) {
+  return environmentId === getLocalEnvironmentId();
 }
 
 function parsePortInput(portValue: any): number[] {
@@ -515,6 +572,10 @@ function humanFileSize(bytes: number) {
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+function isPlatformManagedNetwork(networkName: string) {
+  return Array.isArray(CONFIG.PLATFORM_MANAGED_NETWORKS) && CONFIG.PLATFORM_MANAGED_NETWORKS.includes(networkName);
+}
+
 function walkFiles(baseDir: string, currentDir = baseDir, results: Array<{ path: string; size: number }> = []) {
   const entries = fs.readdirSync(currentDir, { withFileTypes: true });
   for (const entry of entries) {
@@ -537,7 +598,13 @@ function sumFileSizes(files: Array<{ size: number }>) {
 function resolveComposePathFromRuntime(labels: Record<string, string>) {
   const workingDir = labels["com.docker.compose.project.working_dir"];
   const configFiles = labels["com.docker.compose.project.config_files"];
-  const candidates = [
+  const candidates = resolveComposePathCandidates(workingDir, configFiles);
+
+  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || null;
+}
+
+function resolveComposePathCandidates(workingDir?: string, configFiles?: string) {
+  return [
     ...String(configFiles || "")
       .split(",")
       .map((item) => item.trim())
@@ -552,8 +619,92 @@ function resolveComposePathFromRuntime(labels: Record<string, string>) {
         ]
       : []),
   ];
+}
 
-  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || null;
+async function remotePathAccessibleWithSsh(
+  ssh: NodeSSH,
+  remotePath: string,
+  type: "file" | "dir" | "any" = "any"
+) {
+  const clauses: string[] = [];
+  if (type === "file") {
+    clauses.push(`test -f ${shellQuote(remotePath)}`);
+    clauses.push(`test -r ${shellQuote(remotePath)}`);
+  } else if (type === "dir") {
+    clauses.push(`test -d ${shellQuote(remotePath)}`);
+    clauses.push(`test -r ${shellQuote(remotePath)}`);
+    clauses.push(`test -x ${shellQuote(remotePath)}`);
+  } else {
+    clauses.push(`test -e ${shellQuote(remotePath)}`);
+  }
+  const result = await ssh.execCommand(`${clauses.join(" && ")} && echo ok`);
+  return result.code === 0 && String(result.stdout || "").includes("ok");
+}
+
+async function resolveAccessibleRemoteComposeSource(ssh: NodeSSH, workingDir?: string, configFiles?: string) {
+  const candidates = resolveComposePathCandidates(workingDir, configFiles);
+  for (const candidate of candidates) {
+    const projectDir = path.posix.dirname(candidate);
+    const readable = await remotePathAccessibleWithSsh(ssh, candidate, "file");
+    if (!readable) continue;
+    const dirReadable = await remotePathAccessibleWithSsh(ssh, projectDir, "dir");
+    if (!dirReadable) continue;
+    return {
+      composePath: candidate,
+      projectDir,
+    };
+  }
+  return null;
+}
+
+async function listRemoteContainerInspects(environmentId: string) {
+  const { ssh } = await getSourceEnvironmentConnection(environmentId);
+  try {
+    const result = await ssh.execCommand(
+      "sh -lc 'ids=$(docker ps -aq --no-trunc); if [ -z \"$ids\" ]; then echo \"[]\"; else docker inspect $ids; fi'"
+    );
+    if (result.code !== 0) {
+      throw new Error(result.stderr || "获取远端容器列表失败");
+    }
+    return JSON.parse(result.stdout || "[]") as any[];
+  } finally {
+    ssh.dispose();
+  }
+}
+
+async function readRemoteTextFile(environmentId: string, remotePath: string) {
+  const { ssh } = await getSourceEnvironmentConnection(environmentId);
+  try {
+    const result = await ssh.execCommand(`cat ${shellQuote(remotePath)}`);
+    if (result.code !== 0) {
+      throw new Error(result.stderr || `无法读取远端文件: ${remotePath}`);
+    }
+    return String(result.stdout || "");
+  } finally {
+    ssh.dispose();
+  }
+}
+
+async function remotePathExists(environmentId: string, remotePath: string) {
+  const { ssh } = await getSourceEnvironmentConnection(environmentId);
+  try {
+    const result = await ssh.execCommand(`test -e ${shellQuote(remotePath)} && echo ok`);
+    return String(result.stdout || "").includes("ok");
+  } finally {
+    ssh.dispose();
+  }
+}
+
+async function getRemoteDirectorySize(environmentId: string, remoteDir: string) {
+  const { ssh } = await getSourceEnvironmentConnection(environmentId);
+  try {
+    const result = await ssh.execCommand(`du -sk ${shellQuote(remoteDir)} | awk '{print $1}'`);
+    if (result.code !== 0) return 0;
+    const sizeKb = Number(String(result.stdout || "").trim());
+    return Number.isFinite(sizeKb) ? sizeKb * 1024 : 0;
+  } finally {
+    ssh.dispose();
+  }
 }
 
 function buildRuntimeEnvironment(envList: string[]) {
@@ -575,6 +726,30 @@ function buildRuntimeEnvironment(envList: string[]) {
 function getContainerDisplayName(container: any) {
   const raw = String(container?.Names?.[0] || container?.Name || container?.Id || "container");
   return raw.replace(/^\//, "");
+}
+
+function getComposeLabels(container: any) {
+  return container?.Labels || container?.Config?.Labels || {};
+}
+
+function getContainerImage(container: any) {
+  return String(container?.Image || container?.Config?.Image || "").trim();
+}
+
+function isRunningContainer(container: any) {
+  if (typeof container?.State === "string") {
+    return container.State === "running";
+  }
+  return container?.State?.Running === true;
+}
+
+function getContainerNames(container: any) {
+  const names = Array.isArray(container?.Names)
+    ? container.Names
+    : container?.Name
+      ? [container.Name]
+      : [];
+  return names.map((name: string) => String(name || "").replace(/^\//, "")).filter(Boolean);
 }
 
 function buildSnapshotServiceName(rawName: string, fallbackId?: string) {
@@ -738,6 +913,7 @@ async function buildRuntimeComposeSnapshotSource(input: {
   fs.writeFileSync(composePath, yaml.dump(compose, { noRefs: true, lineWidth: -1 }), "utf-8");
 
   return {
+    environmentId: getLocalEnvironmentId(),
     name: projectName,
     path: snapshotDir,
     projectDir: snapshotDir,
@@ -847,6 +1023,7 @@ async function buildStandaloneContainerSnapshotSource(container: any) {
   fs.writeFileSync(composePath, yaml.dump(compose, { noRefs: true, lineWidth: -1 }), "utf-8");
 
   return {
+    environmentId: getLocalEnvironmentId(),
     name: containerName || serviceName,
     path: snapshotDir,
     projectDir: snapshotDir,
@@ -861,7 +1038,242 @@ async function buildStandaloneContainerSnapshotSource(container: any) {
   };
 }
 
-async function discoverMigrationProjects(): Promise<MigrationProjectSource[]> {
+function buildRemoteComposeSnapshotSource(input: {
+  environmentId: string;
+  projectName: string;
+  inspects: any[];
+  fallbackServices: string[];
+  runningContainerCount: number;
+  warning?: string;
+}) {
+  const { environmentId, projectName, inspects, fallbackServices, runningContainerCount, warning } = input;
+  if (!projectName || inspects.length === 0) return null;
+  ensureDir(runtimeSnapshotRootForEnvironment(environmentId));
+  const snapshotDir = path.join(runtimeSnapshotRootForEnvironment(environmentId), sanitizeName(projectName));
+  ensureDir(snapshotDir);
+
+  const preferredByService = new Map<string, any>();
+  for (const inspect of inspects) {
+    const serviceName = inspect?.Config?.Labels?.["com.docker.compose.service"];
+    if (!serviceName) continue;
+    const current = preferredByService.get(serviceName);
+    const currentRunning = current?.State?.Running;
+    const nextRunning = inspect?.State?.Running;
+    if (!current || (!currentRunning && nextRunning)) {
+      preferredByService.set(serviceName, inspect);
+    }
+  }
+
+  const compose: any = {
+    version: "3.9",
+    services: {},
+    volumes: {},
+    networks: {},
+  };
+
+  for (const [serviceName, inspect] of preferredByService.entries()) {
+    const service: any = {};
+    if (inspect?.Config?.Image) service.image = inspect.Config.Image;
+    if (Array.isArray(inspect?.Config?.Env) && inspect.Config.Env.length > 0) {
+      service.environment = buildRuntimeEnvironment(inspect.Config.Env);
+    }
+    if (inspect?.Config?.WorkingDir) service.working_dir = inspect.Config.WorkingDir;
+    if (inspect?.Config?.User) service.user = inspect.Config.User;
+    if (Array.isArray(inspect?.Config?.Entrypoint) && inspect.Config.Entrypoint.length > 0) {
+      service.entrypoint = inspect.Config.Entrypoint;
+    }
+    if (Array.isArray(inspect?.Config?.Cmd) && inspect.Config.Cmd.length > 0) {
+      service.command = inspect.Config.Cmd;
+    }
+    const restartPolicy = String(inspect?.HostConfig?.RestartPolicy?.Name || "").trim();
+    if (restartPolicy && restartPolicy !== "no") {
+      service.restart = restartPolicy;
+    }
+    if (inspect?.HostConfig?.NetworkMode === "host") {
+      service.network_mode = "host";
+    }
+
+    const ports = deriveRuntimePortMappings(inspect?.HostConfig?.PortBindings);
+    if (ports.length > 0) {
+      service.ports = ports;
+    }
+
+    const volumes: any[] = [];
+    for (const mount of inspect?.Mounts || []) {
+      if (!mount?.Destination) continue;
+      if (mount.Type === "volume" && mount.Name) {
+        const volumeKey = String(mount.Name);
+        const suffix = mount.RW === false ? ":ro" : "";
+        volumes.push(`${volumeKey}:${mount.Destination}${suffix}`);
+        compose.volumes[volumeKey] = {
+          ...(compose.volumes[volumeKey] || {}),
+          name: mount.Name,
+          ...(mount.Driver && mount.Driver !== "local" ? { driver: mount.Driver } : {}),
+        };
+        continue;
+      }
+      if (mount.Type === "bind" && mount.Source) {
+        volumes.push({
+          type: "bind",
+          source: mount.Source,
+          target: mount.Destination,
+          ...(mount.RW === false ? { read_only: true } : {}),
+        });
+      }
+    }
+    if (volumes.length > 0) {
+      service.volumes = volumes;
+    }
+
+    const attachedNetworks = Object.keys(inspect?.NetworkSettings?.Networks || {}).filter((networkName) => networkName !== "host");
+    if (attachedNetworks.length > 0 && service.network_mode !== "host") {
+      service.networks = attachedNetworks.map((networkName) => {
+        const derived = deriveRuntimeNetworkSpec(projectName, networkName);
+        if (!compose.networks[derived.logicalName]) {
+          compose.networks[derived.logicalName] = derived.definition;
+        }
+        return derived.logicalName;
+      });
+    }
+
+    compose.services[serviceName] = service;
+  }
+
+  const services = Object.keys(compose.services);
+  if (services.length === 0) return null;
+  if (Object.keys(compose.volumes).length === 0) delete compose.volumes;
+  if (Object.keys(compose.networks).length === 0) delete compose.networks;
+
+  const composePath = path.join(snapshotDir, "docker-compose.runtime.yml");
+  fs.writeFileSync(composePath, yaml.dump(compose, { noRefs: true, lineWidth: -1 }), "utf-8");
+
+  return {
+    environmentId,
+    name: projectName,
+    path: `remote-snapshot:${environmentId}:${projectName}`,
+    projectDir: snapshotDir,
+    composePath,
+    services: services.length > 0 ? services.sort() : fallbackServices.slice().sort(),
+    sourceType: "runtime-compose" as const,
+    sourceKind: "compose-project" as const,
+    selectionMode: "whole-project" as const,
+    planningMode: "runtime-snapshot" as const,
+    description: warning
+      ? `来自服务器运行态（${runningContainerCount} 个容器），原始 Compose 目录不可读，已自动降级为快照迁移`
+      : `来自服务器运行态（${runningContainerCount} 个容器），已按容器配置生成 Compose 快照`,
+    runningContainerCount,
+    warning,
+  } satisfies MigrationProjectSource;
+}
+
+function buildRemoteStandaloneSnapshotSource(environmentId: string, inspect: any) {
+  const containerName = getContainerDisplayName(inspect);
+  const snapshotDir = path.join(
+    runtimeSnapshotRootForEnvironment(environmentId),
+    `standalone-${sanitizeName(containerName || inspect?.Id || "container")}`
+  );
+  ensureDir(runtimeSnapshotRootForEnvironment(environmentId));
+  ensureDir(snapshotDir);
+
+  const serviceName = buildSnapshotServiceName(containerName, inspect?.Id);
+  const compose: any = {
+    version: "3.9",
+    services: {},
+    volumes: {},
+    networks: {},
+  };
+
+  const service: any = {};
+  if (inspect?.Config?.Image) service.image = inspect.Config.Image;
+  if (Array.isArray(inspect?.Config?.Env) && inspect.Config.Env.length > 0) {
+    service.environment = buildRuntimeEnvironment(inspect.Config.Env);
+  }
+  if (inspect?.Config?.WorkingDir) service.working_dir = inspect.Config.WorkingDir;
+  if (inspect?.Config?.User) service.user = inspect.Config.User;
+  if (Array.isArray(inspect?.Config?.Entrypoint) && inspect.Config.Entrypoint.length > 0) {
+    service.entrypoint = inspect.Config.Entrypoint;
+  }
+  if (Array.isArray(inspect?.Config?.Cmd) && inspect.Config.Cmd.length > 0) {
+    service.command = inspect.Config.Cmd;
+  }
+  const restartPolicy = String(inspect?.HostConfig?.RestartPolicy?.Name || "").trim();
+  if (restartPolicy && restartPolicy !== "no") {
+    service.restart = restartPolicy;
+  }
+  if (inspect?.HostConfig?.NetworkMode === "host") {
+    service.network_mode = "host";
+  }
+
+  const ports = deriveRuntimePortMappings(inspect?.HostConfig?.PortBindings);
+  if (ports.length > 0) {
+    service.ports = ports;
+  }
+
+  const volumes: any[] = [];
+  for (const mount of inspect?.Mounts || []) {
+    if (!mount?.Destination) continue;
+    if (mount.Type === "volume" && mount.Name) {
+      const volumeKey = String(mount.Name);
+      const suffix = mount.RW === false ? ":ro" : "";
+      volumes.push(`${volumeKey}:${mount.Destination}${suffix}`);
+      compose.volumes[volumeKey] = {
+        ...(compose.volumes[volumeKey] || {}),
+        name: mount.Name,
+        ...(mount.Driver && mount.Driver !== "local" ? { driver: mount.Driver } : {}),
+      };
+      continue;
+    }
+    if (mount.Type === "bind" && mount.Source) {
+      volumes.push({
+        type: "bind",
+        source: mount.Source,
+        target: mount.Destination,
+        ...(mount.RW === false ? { read_only: true } : {}),
+      });
+    }
+  }
+  if (volumes.length > 0) {
+    service.volumes = volumes;
+  }
+
+  const attachedNetworks = Object.keys(inspect?.NetworkSettings?.Networks || {}).filter((networkName) => networkName !== "host");
+  if (attachedNetworks.length > 0 && service.network_mode !== "host") {
+    service.networks = attachedNetworks.map((networkName) => {
+      const logicalName = sanitizeName(networkName);
+      if (!compose.networks[logicalName]) {
+        compose.networks[logicalName] = {
+          external: true,
+          name: networkName,
+        };
+      }
+      return logicalName;
+    });
+  }
+
+  compose.services[serviceName] = service;
+  if (Object.keys(compose.volumes).length === 0) delete compose.volumes;
+  if (Object.keys(compose.networks).length === 0) delete compose.networks;
+
+  const composePath = path.join(snapshotDir, "docker-compose.runtime.yml");
+  fs.writeFileSync(composePath, yaml.dump(compose, { noRefs: true, lineWidth: -1 }), "utf-8");
+
+  return {
+    environmentId,
+    name: containerName || serviceName,
+    path: `remote-standalone:${environmentId}:${inspect?.Id || serviceName}`,
+    projectDir: snapshotDir,
+    composePath,
+    services: [serviceName],
+    sourceType: "runtime-container" as const,
+    sourceKind: "standalone-container" as const,
+    selectionMode: "single-service" as const,
+    planningMode: "runtime-snapshot" as const,
+    description: `来自服务器运行态的独立容器 ${containerName || serviceName}`,
+    runningContainerCount: inspect?.State?.Running ? 1 : 0,
+  } satisfies MigrationProjectSource;
+}
+
+async function discoverLocalMigrationProjects(): Promise<MigrationProjectSource[]> {
   const projectsRoot = path.join(CONFIG.DATA_DIR, "projects");
   const discovered = new Map<string, MigrationProjectSource>();
 
@@ -877,6 +1289,7 @@ async function discoverMigrationProjects(): Promise<MigrationProjectSource[]> {
       if (!composePath) continue;
       const compose = yaml.load(fs.readFileSync(composePath, "utf-8")) as any;
       discovered.set(path.resolve(projectDir), {
+        environmentId: getLocalEnvironmentId(),
         name: entry,
         path: path.resolve(projectDir),
         projectDir: path.resolve(projectDir),
@@ -934,6 +1347,7 @@ async function discoverMigrationProjects(): Promise<MigrationProjectSource[]> {
         const key = path.resolve(projectDir);
         const existing = discovered.get(key);
         discovered.set(key, {
+          environmentId: getLocalEnvironmentId(),
           name: existing?.name || group.name,
           path: key,
           projectDir: key,
@@ -987,8 +1401,151 @@ async function discoverMigrationProjects(): Promise<MigrationProjectSource[]> {
   });
 }
 
-async function resolveMigrationProjectSource(projectPath: string) {
-  const sources = await discoverMigrationProjects();
+async function discoverRemoteMigrationProjects(environmentId: string): Promise<MigrationProjectSource[]> {
+  const discovered = new Map<string, MigrationProjectSource>();
+  const { ssh, environment } = await getSourceEnvironmentConnection(environmentId);
+
+  try {
+    const workdir = environment.workdir || "/opt/docker-projects";
+    const composeList = await ssh.execCommand(
+      `sh -lc 'root=${shellQuote(workdir)}; if [ -d "$root" ]; then find "$root" -maxdepth 2 -type f \\( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \\) -print; fi'`
+    );
+    if (composeList.code === 0) {
+      for (const rawPath of String(composeList.stdout || "")
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean)) {
+        try {
+          const composeText = await readRemoteTextFile(environmentId, rawPath);
+          const compose = yaml.load(composeText) as any;
+          const projectDir = path.posix.dirname(rawPath);
+          discovered.set(`remote:${environmentId}:${projectDir}`, {
+            environmentId,
+            name: path.posix.basename(projectDir),
+            path: projectDir,
+            projectDir,
+            composePath: rawPath,
+            services: Object.keys(compose?.services || {}),
+            sourceType: "managed-project",
+            sourceKind: "compose-project",
+            selectionMode: "whole-project",
+            planningMode: "compose-file",
+            description: "来自服务器工作目录",
+            runningContainerCount: 0,
+            remoteProjectDir: projectDir,
+            remoteComposePath: rawPath,
+          });
+        } catch {
+          // ignore unreadable compose candidates
+        }
+      }
+    }
+
+    const inspects = await listRemoteContainerInspects(environmentId);
+    const grouped = new Map<
+      string,
+      {
+        name: string;
+        services: Set<string>;
+        labels: Record<string, string>;
+        count: number;
+        inspects: any[];
+      }
+    >();
+
+    for (const inspect of inspects) {
+      const labels = inspect?.Config?.Labels || {};
+      const projectName = labels["com.docker.compose.project"];
+      const serviceName = labels["com.docker.compose.service"];
+      if (!projectName || !serviceName) continue;
+      const group = grouped.get(projectName) || {
+        name: projectName,
+        services: new Set<string>(),
+        labels,
+        count: 0,
+        inspects: [],
+      };
+      group.services.add(serviceName);
+      group.count += 1;
+      group.inspects.push(inspect);
+      if (!group.labels["com.docker.compose.project.config_files"] && labels["com.docker.compose.project.config_files"]) {
+        group.labels = labels;
+      }
+      grouped.set(projectName, group);
+    }
+
+    for (const group of grouped.values()) {
+      const runtimeCompose = await resolveAccessibleRemoteComposeSource(
+        ssh,
+        group.labels["com.docker.compose.project.working_dir"],
+        group.labels["com.docker.compose.project.config_files"]
+      );
+      const services = Array.from(group.services).sort();
+      if (runtimeCompose) {
+        const runtimeComposePath = runtimeCompose.composePath;
+        const projectDir = runtimeCompose.projectDir;
+        const key = `remote:${environmentId}:${projectDir}`;
+        const existing = discovered.get(key);
+        discovered.set(key, {
+          environmentId,
+          name: existing?.name || group.name,
+          path: projectDir,
+          projectDir,
+          composePath: runtimeComposePath,
+          services: existing?.services?.length ? Array.from(new Set([...existing.services, ...services])).sort() : services,
+          sourceType: "runtime-compose",
+          sourceKind: "compose-project",
+          selectionMode: "whole-project",
+          planningMode: existing?.planningMode || "compose-file",
+          description: `来自服务器 Docker 运行态（${group.count} 个容器）`,
+          runningContainerCount: group.count,
+          remoteProjectDir: projectDir,
+          remoteComposePath: runtimeComposePath,
+        });
+        continue;
+      }
+
+      const rawCandidates = resolveComposePathCandidates(
+        group.labels["com.docker.compose.project.working_dir"],
+        group.labels["com.docker.compose.project.config_files"]
+      );
+      const fallbackWarning =
+        rawCandidates.length > 0
+          ? `原始 Compose 目录不可读或已不存在（${rawCandidates[0]}），已自动降级为运行态快照。`
+          : "未从运行态标签中解析到可读的 Compose 文件，已自动降级为运行态快照。";
+      const snapshotSource = buildRemoteComposeSnapshotSource({
+        environmentId,
+        projectName: group.name,
+        inspects: group.inspects,
+        fallbackServices: services,
+        runningContainerCount: group.count,
+        warning: fallbackWarning,
+      });
+      if (!snapshotSource) continue;
+      discovered.set(snapshotSource.path, snapshotSource);
+    }
+
+    for (const inspect of inspects) {
+      const labels = inspect?.Config?.Labels || {};
+      if (labels["com.docker.compose.project"] || labels["com.docker.compose.service"]) {
+        continue;
+      }
+      const snapshotSource = buildRemoteStandaloneSnapshotSource(environmentId, inspect);
+      discovered.set(snapshotSource.path, snapshotSource);
+    }
+  } finally {
+    ssh.dispose();
+  }
+
+  return Array.from(discovered.values()).sort((left, right) => left.name.localeCompare(right.name));
+}
+
+async function discoverMigrationProjects(environmentId = getLocalEnvironmentId()): Promise<MigrationProjectSource[]> {
+  return isLocalEnvironment(environmentId) ? discoverLocalMigrationProjects() : discoverRemoteMigrationProjects(environmentId);
+}
+
+async function resolveMigrationProjectSource(projectPath: string, environmentId = getLocalEnvironmentId()) {
+  const sources = await discoverMigrationProjects(environmentId);
   return sources.find((source) => source.path === path.resolve(projectPath) || source.path === projectPath) || null;
 }
 
@@ -1007,46 +1564,90 @@ function deriveServiceClosure(compose: any, rootService: string) {
   return Array.from(selected);
 }
 
-async function listLocalComposeContainers(projectName: string) {
+async function listComposeContainers(projectName: string, environmentId = getLocalEnvironmentId()) {
   try {
-    const containers = await docker.listContainers({ all: true });
-    return containers.filter((container: any) => container.Labels?.["com.docker.compose.project"] === projectName);
+    if (isLocalEnvironment(environmentId)) {
+      const containers = await docker.listContainers({ all: true });
+      return containers.filter((container: any) => container.Labels?.["com.docker.compose.project"] === projectName);
+    }
+    const inspects = await listRemoteContainerInspects(environmentId);
+    return inspects.filter((inspect: any) => inspect?.Config?.Labels?.["com.docker.compose.project"] === projectName);
   } catch {
     return [];
   }
 }
 
-async function estimateNamedVolumeSize(volumeName: string) {
+async function estimateNamedVolumeSize(volumeName: string, environmentId = getLocalEnvironmentId()) {
   try {
-    const { stdout } = await execAsync(`docker run --rm -v ${shellQuote(volumeName)}:/from ${HELPER_IMAGE} sh -c "cd /from && tar -cf - . 2>/dev/null | wc -c"`, {
-      maxBuffer: 16 * 1024 * 1024,
-      shell: "/bin/zsh",
-    });
-    const size = Number(String(stdout).trim());
-    return Number.isFinite(size) ? size : 0;
+    if (isLocalEnvironment(environmentId)) {
+      const { stdout } = await execAsync(
+        `docker run --rm -v ${shellQuote(volumeName)}:/from ${HELPER_IMAGE} sh -c "cd /from && tar -cf - . 2>/dev/null | wc -c"`,
+        {
+          maxBuffer: 16 * 1024 * 1024,
+          shell: "/bin/zsh",
+        }
+      );
+      const size = Number(String(stdout).trim());
+      return Number.isFinite(size) ? size : 0;
+    }
+
+    const { ssh } = await getSourceEnvironmentConnection(environmentId);
+    try {
+      const result = await ssh.execCommand(
+        `docker run --rm -v ${shellQuote(volumeName)}:/from ${HELPER_IMAGE} sh -c "cd /from && tar -cf - . 2>/dev/null | wc -c"`
+      );
+      const size = Number(String(result.stdout || "").trim());
+      return Number.isFinite(size) ? size : 0;
+    } finally {
+      ssh.dispose();
+    }
   } catch {
     return 0;
   }
 }
 
 async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSource | null) {
+  const sourceEnvironmentId = source?.environmentId || planInput.sourceEnvironmentId || getLocalEnvironmentId();
+  if (sourceEnvironmentId === planInput.targetEnvironmentId) {
+    throw new Error("源服务器与目标服务器不能相同，请选择不同的迁移目标");
+  }
+  const targetEnvironment = getEnvironment(planInput.targetEnvironmentId);
+  if (!targetEnvironment.capabilities.modules.migrateTarget) {
+    throw new Error("目标环境缺少迁移所需权限，请先在环境接入中完成校验并补齐 elevated 权限");
+  }
+  const targetHost = getTargetHostFromEnvironment(planInput.targetEnvironmentId);
   ensureDir(migrationRoot());
+  const sessionId = crypto.randomUUID();
+  const localSessionDir = sessionDir(sessionId);
+  const localArtifactsDir = artifactsDir(sessionId);
+  ensureDir(localArtifactsDir);
   const projectsRoot = path.join(CONFIG.DATA_DIR, "projects");
   const resolvedProjectsRoot = path.resolve(projectsRoot);
-  const projectDir = source
-    ? path.resolve(source.projectDir)
+  const remoteSource = !isLocalEnvironment(sourceEnvironmentId);
+  const fallbackProjectDir = remoteSource
+    ? planInput.projectPath
     : path.isAbsolute(planInput.projectPath)
       ? path.resolve(planInput.projectPath)
       : path.resolve(projectsRoot, planInput.projectPath);
-  if (!source && !projectDir.startsWith(`${resolvedProjectsRoot}${path.sep}`) && projectDir !== resolvedProjectsRoot) {
+  let projectDir = source ? source.projectDir : fallbackProjectDir;
+  if (!remoteSource && !source && !projectDir.startsWith(`${resolvedProjectsRoot}${path.sep}`) && projectDir !== resolvedProjectsRoot) {
     throw new Error("projectPath 超出允许的项目目录范围");
   }
-  const composePath = source?.composePath || path.join(projectDir, "docker-compose.yml");
-  if (!fs.existsSync(composePath)) {
-    throw new Error(`未找到项目配置文件: ${composePath}`);
+  let composePath = source?.composePath || path.join(projectDir, "docker-compose.yml");
+  let rawCompose = "";
+  if (remoteSource && source?.planningMode !== "runtime-snapshot") {
+    const remoteComposePath = source?.remoteComposePath || composePath;
+    rawCompose = await readRemoteTextFile(sourceEnvironmentId, remoteComposePath);
+    projectDir = source?.remoteProjectDir || path.posix.dirname(remoteComposePath);
+    composePath = remoteComposePath;
+  } else {
+    projectDir = path.resolve(projectDir);
+    composePath = path.resolve(composePath);
+    if (!fs.existsSync(composePath)) {
+      throw new Error(`未找到项目配置文件: ${composePath}`);
+    }
+    rawCompose = fs.readFileSync(composePath, "utf-8");
   }
-
-  const rawCompose = fs.readFileSync(composePath, "utf-8");
   const compose = yaml.load(rawCompose) as any;
   const composeServiceNames = Object.keys(compose?.services || {});
   if (composeServiceNames.length === 0) {
@@ -1057,12 +1658,8 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
   const selectedServices =
     source?.selectionMode === "whole-project" ? composeServiceNames : deriveServiceClosure(compose, effectiveRootService);
   const dependencyServices = selectedServices.filter((service) => service !== effectiveRootService);
-  const sessionId = crypto.randomUUID();
   const projectName = source?.name || path.basename(projectDir);
   const workdir = `/var/lib/docker-proxy-migrate/${sessionId}`;
-  const localSessionDir = sessionDir(sessionId);
-  const localArtifactsDir = artifactsDir(sessionId);
-  ensureDir(localArtifactsDir);
 
   const allMounts = Object.entries<any>(compose.services || {}).flatMap(([serviceName, service]) =>
     collectServiceMounts(serviceName, service, projectDir)
@@ -1132,6 +1729,24 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
       detail: "独立容器按单容器迁移，运行态快照会覆盖镜像、环境变量、端口、卷和网络。",
     });
   }
+  if (source?.warning) {
+    readOnlyInspect.push({
+      kind: "source_warning",
+      label: "来源已自动降级",
+      classification: "read-only inspect",
+      detail: source.warning,
+    });
+    risks.push({
+      id: `${projectName}-source-warning`,
+      level: "medium",
+      title: "来源已降级为运行态快照",
+      category: "source_fallback",
+      scope: projectName,
+      reason: source.warning,
+      blocking: false,
+      recommendation: "如果需要完整保留原始 Compose、相对 bind mount 和 env_file 语义，建议恢复源服务器项目目录后重新生成计划。",
+    });
+  }
 
   for (const serviceName of selectedServices) {
     const service = compose.services[serviceName];
@@ -1168,8 +1783,14 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
     }
 
     for (const envFile of collectEnvFiles(service)) {
-      const absoluteEnv = path.resolve(projectDir, envFile);
-      if (!fs.existsSync(absoluteEnv)) {
+      const absoluteEnv = remoteSource && source?.planningMode !== "runtime-snapshot"
+        ? path.posix.resolve(projectDir, envFile)
+        : path.resolve(projectDir, envFile);
+      const envExists =
+        remoteSource && source?.planningMode !== "runtime-snapshot"
+          ? await remotePathExists(sourceEnvironmentId, absoluteEnv)
+          : fs.existsSync(absoluteEnv);
+      if (!envExists) {
         risks.push({
           id: `${serviceName}-env-${envFile}`,
           level: "high",
@@ -1344,7 +1965,7 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
       const archiveName = `${sanitizeName(volumeName)}.tar`;
       const archivePath = path.join(localArtifactsDir, archiveName);
       const stagingVolume = `mig_${sessionId.slice(0, 8)}_${sanitizeName(volumeName)}`;
-      const estimatedVolumeBytes = await estimateNamedVolumeSize(volumeName);
+      const estimatedVolumeBytes = await estimateNamedVolumeSize(volumeName, sourceEnvironmentId);
       if (estimatedVolumeBytes === 0) {
         unknownVolumeSize = true;
       } else {
@@ -1378,7 +1999,9 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
           kind: "network",
           label: networkName,
           classification: "needs cutover",
-          detail: "cutover 阶段才允许附加到现有外部网络。",
+          detail: isPlatformManagedNetwork(networkName)
+            ? "切换阶段会附加到外部网络；若目标机缺少该平台托管网络，系统会自动创建。"
+            : "cutover 阶段才允许附加到现有外部网络。",
         });
       } else {
         internalNetworks.add(networkName);
@@ -1439,17 +2062,17 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
     }
   }
 
-  const localContainers = await listLocalComposeContainers(projectName);
+  const localContainers = await listComposeContainers(projectName, sourceEnvironmentId);
   const runtimeDrift = selectedServices.map<ServiceRuntimeDrift>((serviceName) => {
     const service = compose.services[serviceName];
-    const containers = localContainers.filter((container: any) => container.Labels?.["com.docker.compose.service"] === serviceName);
+    const containers = localContainers.filter((container: any) => getComposeLabels(container)?.["com.docker.compose.service"] === serviceName);
     const notes: string[] = [];
     if (containers.length === 0) {
       notes.push("本地未发现该服务对应的运行中 Compose 容器。");
     }
     const configuredImage = service?.image;
-    if (configuredImage && containers.some((container: any) => container.Image !== configuredImage)) {
-      notes.push(`运行中镜像与 Compose 不一致，当前为 ${containers.map((container: any) => container.Image).join(", ")}`);
+    if (configuredImage && containers.some((container: any) => getContainerImage(container) !== configuredImage)) {
+      notes.push(`运行中镜像与 Compose 不一致，当前为 ${containers.map((container: any) => getContainerImage(container)).join(", ")}`);
       risks.push({
         id: `${serviceName}-runtime-drift-image`,
         level: "medium",
@@ -1463,14 +2086,17 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
     }
     return {
       service: serviceName,
-      running: containers.some((container: any) => container.State === "running"),
-      containerNames: containers.map((container: any) => String(container.Names?.[0] || "").replace(/^\//, "")),
+      running: containers.some((container: any) => isRunningContainer(container)),
+      containerNames: containers.flatMap((container: any) => getContainerNames(container)),
       notes,
     };
   });
 
-  const localFileManifest = walkFiles(projectDir);
-  const localProjectBytes = sumFileSizes(localFileManifest);
+  const localFileManifest = !remoteSource || source?.planningMode === "runtime-snapshot" ? walkFiles(projectDir) : [];
+  const localProjectBytes =
+    !remoteSource || source?.planningMode === "runtime-snapshot"
+      ? sumFileSizes(localFileManifest)
+      : await getRemoteDirectorySize(sourceEnvironmentId, projectDir);
   const transferEstimate = {
     totalBytes: localProjectBytes + knownVolumeBytes,
     knownVolumeBytes,
@@ -1526,9 +2152,9 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
     risks,
     conflicts,
     target: {
-      host: planInput.targetHost.host,
-      port: Number(planInput.targetHost.port || 22),
-      username: planInput.targetHost.username,
+      host: targetHost.host,
+      port: Number(targetHost.port || 22),
+      username: targetHost.username,
       workdir,
     },
     artifactPaths: {
@@ -1541,12 +2167,12 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
     transferEstimate,
   };
 
-  const preflight = await runRemotePreflight(planBase, planInput.targetHost, Array.from(targetPorts), Array.from(externalNetworks));
+  const preflight = await runRemotePreflight(planBase, targetHost, Array.from(targetPorts), Array.from(externalNetworks));
   planBase.risks.push(...preflight.risks);
   planBase.conflicts.push(...preflight.conflicts);
   planBase.readOnlyInspect.push(...preflight.readOnlyInspect);
   planBase.safetyBoundary.permissions = [
-    { kind: "ssh", label: `${planInput.targetHost.username}@${planInput.targetHost.host}`, detail: "仅使用当前 SSH 账号连接目标机" },
+    { kind: "ssh", label: `${targetHost.username}@${targetHost.host}`, detail: "仅使用当前 SSH 账号连接目标机" },
     ...(preflight.missingPermissions.length > 0
       ? preflight.missingPermissions.map((item) => ({
           kind: "permission",
@@ -1610,6 +2236,8 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
     projectName,
     projectPath: source?.path || planInput.projectPath,
     composePath,
+    sourceEnvironmentId,
+    targetEnvironmentId: planInput.targetEnvironmentId,
     rootService: effectiveRootService,
     dependencyServices,
     selectedServices,
@@ -1649,12 +2277,26 @@ async function analyzeProject(planInput: PlanInput, source?: MigrationProjectSou
       remoteArtifactsDir: `${workdir}/artifacts`,
       remoteComposePath: `${workdir}/artifacts/staging-compose.yml`,
       remoteCutoverComposePath: `${workdir}/artifacts/cutover-compose.yml`,
+      remoteProjectArchivePath:
+        remoteSource && source?.planningMode !== "runtime-snapshot" ? `${workdir}/artifacts/source-project.tar` : undefined,
       localSessionDir,
       localArtifactsDir,
-      localProjectDir: projectDir,
-      localComposePath: composePath,
+      localProjectDir: remoteSource && source?.planningMode !== "runtime-snapshot" ? path.join(localSessionDir, "source-project") : projectDir,
+      localProjectArchivePath:
+        remoteSource && source?.planningMode !== "runtime-snapshot" ? path.join(localSessionDir, "source-project.tar") : undefined,
+      localComposePath:
+        remoteSource && source?.planningMode !== "runtime-snapshot"
+          ? path.join(
+              path.join(localSessionDir, "source-project"),
+              path.posix.relative(source?.remoteProjectDir || projectDir, source?.remoteComposePath || composePath)
+            )
+          : composePath,
       localProjectBytes,
       localFileManifest,
+      sourceProjectCached: !remoteSource || source?.planningMode === "runtime-snapshot",
+      sourceRemoteProjectDir: remoteSource ? source?.remoteProjectDir || projectDir : undefined,
+      sourceRemoteComposePath: remoteSource ? source?.remoteComposePath || composePath : undefined,
+      sourceWorkdir: remoteSource ? getEnvironment(sourceEnvironmentId).workdir : undefined,
       namedVolumeArchives,
     },
   };
@@ -1918,9 +2560,32 @@ async function runRemotePreflight(plan: Omit<MigrationPlan, "preflight">, target
         kind: "network",
         label: networkName,
         classification: "read-only inspect",
-        detail: "目标机外部网络存在性检查",
+        detail: isPlatformManagedNetwork(networkName)
+          ? "平台托管外部网络检查，缺失时会尝试自动创建。"
+          : "目标机外部网络存在性检查",
       });
       if (networkCheck.code !== 0) {
+        if (isPlatformManagedNetwork(networkName)) {
+          const createNetwork = await ssh.execCommand(`docker network create ${shellQuote(networkName)}`);
+          if (createNetwork.code === 0) {
+            inspectItems.push({
+              kind: "network",
+              label: networkName,
+              classification: "new staging resource",
+              detail: "目标机原本缺少该平台托管网络，preflight 已自动创建。",
+            });
+            continue;
+          }
+          conflicts.push({
+            id: `external-network-${networkName}`,
+            kind: "network",
+            target: networkName,
+            reason: `目标机缺少平台托管网络 ${networkName}，且自动创建失败：${createNetwork.stderr || createNetwork.stdout || "unknown error"}`,
+            blocking: true,
+            recommendation: "检查目标机 Docker 权限，或手工创建该网络后重新生成计划。",
+          });
+          continue;
+        }
         conflicts.push({
           id: `external-network-${networkName}`,
           kind: "network",
@@ -2097,21 +2762,184 @@ function sessionStatusAfterPhase(phase: Phase): SessionStatus {
   return "running";
 }
 
-async function exportNamedVolume(sessionId: string, archive: MigrationSession["internal"]["namedVolumeArchives"][number]) {
+async function extractLocalTarArchive(archivePath: string, destinationDir: string) {
+  await execAsync(`tar -xf ${shellQuote(archivePath)} -C ${shellQuote(destinationDir)}`, {
+    shell: "/bin/zsh",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+}
+
+async function streamRemoteProjectArchiveToLocal(
+  ssh: NodeSSH,
+  sessionId: string,
+  remoteProjectDir: string,
+  localArchivePath: string
+) {
+  const connection = (ssh as any).getConnection ? (ssh as any).getConnection() : (ssh as any).connection;
+  if (!connection) {
+    throw new Error("SSH 连接不可用，无法流式下载源项目归档");
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const output = fs.createWriteStream(localArchivePath);
+    let stderrBuffer = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      output.close();
+      if (error) reject(error);
+      else resolve();
+    };
+
+    connection.exec(
+      `tar --warning=no-file-ignored --ignore-failed-read -cf - -C ${shellQuote(remoteProjectDir)} .`,
+      {},
+      (error: Error | undefined, channel: any) => {
+        if (error) {
+          finish(error);
+          return;
+        }
+
+        channel.on("data", (chunk: Buffer) => {
+          output.write(chunk);
+        });
+        channel.stderr.on("data", (chunk: Buffer) => {
+          const text = chunk.toString("utf-8");
+          stderrBuffer += text;
+          for (const line of text.split("\n").map((item) => item.trim()).filter(Boolean)) {
+            appendEvent({
+              sessionId,
+              type: "command_log",
+              ts: nowIso(),
+              phase: "sync",
+              step: "归档源项目目录",
+              level: "warn",
+              message: line,
+            });
+          }
+        });
+        channel.on("error", (channelError: Error) => {
+          finish(channelError);
+        });
+        channel.on("close", (code: number | null) => {
+          if (code === 0 || code === 1) {
+            finish();
+            return;
+          }
+          finish(new Error(stderrBuffer.trim() || `源项目归档失败，退出码 ${code ?? "unknown"}`));
+        });
+      }
+    );
+  });
+}
+
+async function prepareSourceProjectCache(sessionId: string) {
+  const session = loadSession(sessionId);
+  if (!session) throw new Error("迁移会话不存在");
+  if (session.internal.sourceProjectCached) {
+    return session;
+  }
+  if (isLocalEnvironment(session.sourceEnvironmentId)) {
+    return session;
+  }
+  if (!session.internal.sourceRemoteProjectDir) {
+    throw new Error("源服务器项目目录信息缺失，无法准备迁移缓存");
+  }
+
+  fs.rmSync(session.internal.localProjectDir, { recursive: true, force: true });
+  ensureDir(session.internal.localProjectDir);
+  const { ssh } = await getSourceEnvironmentConnection(session.sourceEnvironmentId);
+  try {
+    const sourceDirAccessible = await remotePathAccessibleWithSsh(ssh, session.internal.sourceRemoteProjectDir, "dir");
+    if (!sourceDirAccessible) {
+      throw new Error(
+        `源服务器项目目录不可读或已不存在：${session.internal.sourceRemoteProjectDir}。请刷新来源并重新生成计划；如果原始 Compose 目录已经丢失，系统会自动改为运行态快照迁移。`
+      );
+    }
+    appendEvent({
+      sessionId,
+      type: "command_log",
+      ts: nowIso(),
+      phase: "sync",
+      step: "准备源项目缓存",
+      level: "info",
+      message: `从 ${session.sourceEnvironmentId} 归档项目目录 ${session.internal.sourceRemoteProjectDir}，自动跳过 socket / fifo 等特殊文件`,
+    });
+    const localArchivePath =
+      session.internal.localProjectArchivePath || path.join(session.internal.localSessionDir, "source-project.tar");
+    fs.rmSync(localArchivePath, { force: true });
+    try {
+      await streamRemoteProjectArchiveToLocal(ssh, sessionId, session.internal.sourceRemoteProjectDir, localArchivePath);
+    } catch (error: any) {
+      throw new Error(
+        `源服务器项目目录下载失败：${session.internal.sourceRemoteProjectDir}。${error?.message || "请确认目录仍存在且当前 SSH 账号可读。"}`
+      );
+    }
+    try {
+      await extractLocalTarArchive(localArchivePath, session.internal.localProjectDir);
+    } catch (error: any) {
+      throw new Error(`源项目归档解压失败：${error?.stderr || error?.message || "未知错误"}`);
+    }
+  } finally {
+    ssh.dispose();
+  }
+
+  const manifest = walkFiles(session.internal.localProjectDir);
+  const projectBytes = sumFileSizes(manifest);
+  return updateSession(sessionId, (current) => {
+    current.internal.localFileManifest = manifest;
+    current.internal.localProjectBytes = projectBytes;
+    current.internal.sourceProjectCached = true;
+    current.transfer = {
+      ...current.transfer,
+      bytesTotal: Math.max(projectBytes + current.plan.transferEstimate.knownVolumeBytes, current.transfer.bytesTotal || 0),
+    };
+    return current;
+  });
+}
+
+async function exportNamedVolume(
+  sessionId: string,
+  archive: MigrationSession["internal"]["namedVolumeArchives"][number],
+  sourceEnvironmentId = getLocalEnvironmentId()
+) {
   if (fs.existsSync(archive.archivePath)) {
     archive.size = fs.statSync(archive.archivePath).size;
     return archive.size;
   }
   ensureDir(path.dirname(archive.archivePath));
-  const command = `docker run --rm -v ${shellQuote(archive.sourceVolume)}:/from -v ${shellQuote(path.dirname(archive.archivePath))}:/to ${HELPER_IMAGE} sh -c "cd /from && tar -cf /to/${archive.archiveName} ."`;
-  await runCommandWithLogs(command, "sync", `导出卷 ${archive.sourceVolume}`, sessionId);
+  if (isLocalEnvironment(sourceEnvironmentId)) {
+    const command = `docker run --rm -v ${shellQuote(archive.sourceVolume)}:/from -v ${shellQuote(path.dirname(archive.archivePath))}:/to ${HELPER_IMAGE} sh -c "cd /from && tar -cf /to/${archive.archiveName} ."`;
+    await runCommandWithLogs(command, "sync", `导出卷 ${archive.sourceVolume}`, sessionId);
+  } else {
+    const { ssh, environment } = await getSourceEnvironmentConnection(sourceEnvironmentId);
+    const remoteArchiveDir = `${environment.workdir}/.dockerproxy-migrate/${sessionId}/volume-archives`;
+    const remoteArchivePath = `${remoteArchiveDir}/${archive.archiveName}`;
+    try {
+      await runRemoteCommand(
+        ssh,
+        `mkdir -p ${shellQuote(remoteArchiveDir)} && docker run --rm -v ${shellQuote(archive.sourceVolume)}:/from -v ${shellQuote(remoteArchiveDir)}:/to ${HELPER_IMAGE} sh -c "cd /from && tar -cf /to/${archive.archiveName} ."`,
+        sessionId,
+        "sync",
+        `导出源服务器卷 ${archive.sourceVolume}`
+      );
+      await ssh.getFile(archive.archivePath, remoteArchivePath);
+      await runRemoteCommand(ssh, `rm -f ${shellQuote(remoteArchivePath)}`, sessionId, "sync", `清理源服务器归档 ${archive.archiveName}`);
+    } finally {
+      ssh.dispose();
+    }
+  }
   archive.size = fs.existsSync(archive.archivePath) ? fs.statSync(archive.archivePath).size : archive.size;
   return archive.size;
 }
 
 async function syncProjectDirectory(session: MigrationSession, ssh: NodeSSH) {
-  const files = session.internal.localFileManifest;
-  const totalBytes = Math.max(session.transfer.bytesTotal || 0, 1);
+  const preparedSession = await prepareSourceProjectCache(session.id);
+  const files = preparedSession.internal.localFileManifest;
+  const localProjectDir = preparedSession.internal.localProjectDir;
+  const localProjectArchivePath = preparedSession.internal.localProjectArchivePath;
+  const totalBytes = Math.max(preparedSession.transfer.bytesTotal || 0, 1);
   let transferred = 0;
   const startAt = Date.now();
   const sizeMap = new Map(files.map((item) => [item.path, item.size]));
@@ -2124,7 +2952,58 @@ async function syncProjectDirectory(session: MigrationSession, ssh: NodeSSH) {
     "创建远端工作目录"
   );
 
-  await ssh.putDirectory(session.internal.localProjectDir, session.internal.remoteProjectDir, {
+  if (localProjectArchivePath && preparedSession.internal.remoteProjectArchivePath && fs.existsSync(localProjectArchivePath)) {
+    await ssh.putFile(localProjectArchivePath, preparedSession.internal.remoteProjectArchivePath);
+    transferred = Math.min(preparedSession.transfer.bytesTotal || totalBytes, totalBytes);
+    updateSession(session.id, (current) => {
+      current.transfer = {
+        ...current.transfer,
+        currentFile: path.basename(localProjectArchivePath),
+        bytesDone: transferred,
+        bytesTotal: totalBytes,
+        percent: Number(((transferred / totalBytes) * 100).toFixed(1)),
+        speedBytesPerSec: null,
+        etaSeconds: 0,
+        checksumStatus: "pending",
+      };
+      return current;
+    });
+    appendEvent({
+      sessionId: session.id,
+      type: "transfer_progress",
+      ts: nowIso(),
+      phase: "sync",
+      step: "同步项目目录",
+      level: "info",
+      message: `已上传项目归档 ${path.basename(localProjectArchivePath)}，正在目标机解压`,
+      current: transferred,
+      total: totalBytes,
+      percent: Number(((transferred / totalBytes) * 100).toFixed(1)),
+      unit: "bytes",
+      meta: {
+        currentFile: path.basename(localProjectArchivePath),
+      },
+    });
+    await runRemoteCommand(
+      ssh,
+      `mkdir -p ${shellQuote(session.internal.remoteProjectDir)} && tar -xf ${shellQuote(
+        preparedSession.internal.remoteProjectArchivePath
+      )} -C ${shellQuote(session.internal.remoteProjectDir)}`,
+      session.id,
+      "sync",
+      "解压项目目录归档"
+    );
+    await runRemoteCommand(
+      ssh,
+      `rm -f ${shellQuote(preparedSession.internal.remoteProjectArchivePath)}`,
+      session.id,
+      "sync",
+      "清理目标机项目归档"
+    );
+    return;
+  }
+
+  await ssh.putDirectory(localProjectDir, session.internal.remoteProjectDir, {
     recursive: true,
     concurrency: 4,
     tick: (localPath: string, _remotePath: string, error?: Error) => {
@@ -2148,12 +3027,12 @@ async function syncProjectDirectory(session: MigrationSession, ssh: NodeSSH) {
       const etaSeconds = speed > 0 ? Math.ceil(remaining / speed) : null;
 
       updateSession(session.id, (current) => {
-        current.transfer = {
-          ...current.transfer,
-          currentFile: path.relative(session.internal.localProjectDir, localPath),
-          bytesDone: transferred,
-          bytesTotal: totalBytes,
-          percent: Number(((transferred / totalBytes) * 100).toFixed(1)),
+          current.transfer = {
+            ...current.transfer,
+            currentFile: path.relative(localProjectDir, localPath),
+            bytesDone: transferred,
+            bytesTotal: totalBytes,
+            percent: Number(((transferred / totalBytes) * 100).toFixed(1)),
           speedBytesPerSec: Number(speed.toFixed(1)),
           etaSeconds,
           checksumStatus: "pending",
@@ -2168,13 +3047,13 @@ async function syncProjectDirectory(session: MigrationSession, ssh: NodeSSH) {
         phase: "sync",
         step: "同步项目目录",
         level: "info",
-        message: `已同步 ${path.relative(session.internal.localProjectDir, localPath)}`,
+        message: `已同步 ${path.relative(localProjectDir, localPath)}`,
         current: transferred,
         total: totalBytes,
         percent: Number(((transferred / totalBytes) * 100).toFixed(1)),
         unit: "bytes",
         meta: {
-          currentFile: path.relative(session.internal.localProjectDir, localPath),
+          currentFile: path.relative(localProjectDir, localPath),
           etaSeconds,
           speedBytesPerSec: Number(speed.toFixed(1)),
         },
@@ -2195,7 +3074,7 @@ async function uploadNamedVolumes(session: MigrationSession, ssh: NodeSSH) {
   let bytesDone = loadSession(session.id)?.transfer.bytesDone || 0;
   const bytesTotal = Math.max(loadSession(session.id)?.transfer.bytesTotal || 1, 1);
   for (const archive of session.internal.namedVolumeArchives) {
-    await exportNamedVolume(session.id, archive);
+    await exportNamedVolume(session.id, archive, session.sourceEnvironmentId);
     await ssh.putFile(archive.archivePath, `${session.internal.remoteBaseDir}/volume-archives/${archive.archiveName}`);
     processed += 1;
     bytesDone += archive.size || 0;
@@ -2376,22 +3255,50 @@ async function rollbackRemoteSession(session: MigrationSession, target: TargetHo
       privateKey: target.privateKey,
     });
 
-    rollbackActions.push("停止迁移服务");
-    await runRemoteCommand(
-      ssh,
-      `cd ${shellQuote(session.internal.remoteBaseDir)} && docker compose -p ${shellQuote(session.internal.migrationProjectName)} -f ${shellQuote(session.internal.remoteCutoverComposePath)} down -v --remove-orphans || true`,
-      session.id,
-      "verify_or_rollback",
-      "回滚：停止 cutover 服务"
-    );
-    rollbackActions.push("清理隔离资源");
-    await runRemoteCommand(
-      ssh,
-      `cd ${shellQuote(session.internal.remoteBaseDir)} && docker compose -p ${shellQuote(session.internal.migrationProjectName)} -f ${shellQuote(session.internal.remoteComposePath)} down -v --remove-orphans || true`,
-      session.id,
-      "verify_or_rollback",
-      "回滚：停止 staging 服务"
-    );
+    const hasCutoverCompose = await remotePathAccessibleWithSsh(ssh, session.internal.remoteCutoverComposePath, "file");
+    const hasStagingCompose = await remotePathAccessibleWithSsh(ssh, session.internal.remoteComposePath, "file");
+    if (hasCutoverCompose) {
+      rollbackActions.push("停止迁移服务");
+      await runRemoteCommand(
+        ssh,
+        `docker compose -p ${shellQuote(session.internal.migrationProjectName)} -f ${shellQuote(session.internal.remoteCutoverComposePath)} down -v --remove-orphans || true`,
+        session.id,
+        "verify_or_rollback",
+        "回滚：停止 cutover 服务"
+      );
+    } else {
+      rollbackActions.push("跳过 cutover 清理（未生成 cutover Compose）");
+      appendEvent({
+        sessionId: session.id,
+        type: "command_log",
+        ts: nowIso(),
+        phase: "verify_or_rollback",
+        step: "自动回滚",
+        level: "info",
+        message: "跳过 cutover 清理：目标机尚未生成 cutover Compose 文件。",
+      });
+    }
+    if (hasStagingCompose) {
+      rollbackActions.push("清理隔离资源");
+      await runRemoteCommand(
+        ssh,
+        `docker compose -p ${shellQuote(session.internal.migrationProjectName)} -f ${shellQuote(session.internal.remoteComposePath)} down -v --remove-orphans || true`,
+        session.id,
+        "verify_or_rollback",
+        "回滚：停止 staging 服务"
+      );
+    } else {
+      rollbackActions.push("跳过 staging 清理（未生成 staging Compose）");
+      appendEvent({
+        sessionId: session.id,
+        type: "command_log",
+        ts: nowIso(),
+        phase: "verify_or_rollback",
+        step: "自动回滚",
+        level: "info",
+        message: "跳过 staging 清理：目标机尚未生成 staging Compose 文件。",
+      });
+    }
     rollbackActions.push("删除迁移工作目录");
     await runRemoteCommand(
       ssh,
@@ -2572,12 +3479,15 @@ async function executeMigration(sessionId: string, target: TargetHostInput) {
   }
 }
 
-export async function listMigrationProjects() {
-  return discoverMigrationProjects();
+export async function listMigrationProjects(environmentId = getLocalEnvironmentId()) {
+  return discoverMigrationProjects(environmentId);
 }
 
 export async function createMigrationPlan(input: PlanInput) {
-  const source = await resolveMigrationProjectSource(input.projectPath);
+  const source = await resolveMigrationProjectSource(input.projectPath, input.sourceEnvironmentId || getLocalEnvironmentId());
+  if (!source && input.sourceEnvironmentId && !isLocalEnvironment(input.sourceEnvironmentId)) {
+    throw new Error("当前来源已失效，请先刷新来源列表并重新选择迁移对象。");
+  }
   return analyzeProject(input, source);
 }
 
@@ -2585,6 +3495,22 @@ export function getMigrationSession(sessionId: string) {
   const session = loadSession(sessionId);
   if (!session) throw new Error("迁移会话不存在");
   return sanitizeSession(session);
+}
+
+export function listMigrationSessions(serverId?: string) {
+  const root = migrationRoot();
+  if (!fs.existsSync(root)) return [];
+  return fs
+    .readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => loadSession(entry.name))
+    .filter((session): session is MigrationSession => Boolean(session))
+    .filter((session) => {
+      if (!serverId) return true;
+      return session.sourceEnvironmentId === serverId || session.targetEnvironmentId === serverId;
+    })
+    .map((session) => sanitizeSession(session))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 }
 
 export function getMigrationArtifacts(sessionId: string) {
@@ -2616,7 +3542,7 @@ export function getMigrationArtifacts(sessionId: string) {
   return payload;
 }
 
-export async function startMigrationSession(sessionId: string, target: TargetHostInput) {
+export async function startMigrationSession(sessionId: string) {
   const session = loadSession(sessionId);
   if (!session) throw new Error("迁移会话不存在");
   if (session.status !== "plan_ready") {
@@ -2634,6 +3560,7 @@ export async function startMigrationSession(sessionId: string, target: TargetHos
     return current;
   });
 
+  const target = getTargetHostFromEnvironment(session.targetEnvironmentId);
   const execution = executeMigration(sessionId, target).finally(() => {
     activeExecutions.delete(sessionId);
   });
@@ -2641,12 +3568,13 @@ export async function startMigrationSession(sessionId: string, target: TargetHos
   return sanitizeSession(next);
 }
 
-export async function rollbackMigrationSession(sessionId: string, target: TargetHostInput) {
+export async function rollbackMigrationSession(sessionId: string) {
   const session = loadSession(sessionId);
   if (!session) throw new Error("迁移会话不存在");
   if (session.status === "running" || session.status === "verifying" || session.status === "cutover_pending") {
     throw new Error("当前会话仍在执行中，暂不支持手动中断回滚");
   }
+  const target = getTargetHostFromEnvironment(session.targetEnvironmentId);
   return rollbackRemoteSession(session, target, "用户手动触发目标机回滚");
 }
 

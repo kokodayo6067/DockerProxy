@@ -1,52 +1,38 @@
 import { Router } from "express";
-import fs from "fs";
-import path from "path";
-import { getRoutes, saveRoutes, generateNginxConf, reloadNginx } from "../services/nginx";
-import { CONFIG } from "../utils/config";
+import { createRoute, deleteRoute, getRoutes } from "../services/nginx";
+import { getLocalEnvironmentId } from "../services/platform";
 
 const router = Router();
 
 router.get("/routes", (req, res) => {
-  res.json(getRoutes());
+  try {
+    const gatewayId = req.query.gatewayId ? String(req.query.gatewayId) : undefined;
+    const serverId = req.query.serverId ? String(req.query.serverId) : undefined;
+    res.json(getRoutes({ gatewayId, serverId }));
+  } catch (error: any) {
+    res.status(500).json({ error: "获取路由列表失败", details: error.message });
+  }
 });
 
 router.post("/routes", async (req, res) => {
-  const newRoute = { id: Date.now().toString(), ...req.body };
-  const routes = getRoutes();
-  routes.push(newRoute);
-  saveRoutes(routes);
-
-  const confContent = generateNginxConf(newRoute);
-  const confPath = path.join(CONFIG.NGINX_CONF_DIR, `${newRoute.domain}.conf`);
-  fs.writeFileSync(confPath, confContent);
-
   try {
-    await reloadNginx();
-    res.json({ success: true, message: "路由已添加并重载 Nginx" });
+    const route = await createRoute({
+      ...req.body,
+      gatewayId: req.body?.gatewayId,
+      serverId: req.body?.serverId || getLocalEnvironmentId(),
+    });
+    res.json({ success: true, route, message: "路由已写入网关并完成重载" });
   } catch (error: any) {
-    res.status(500).json({ error: "Nginx 重载失败", details: error.message });
+    res.status(400).json({ error: "保存路由失败", details: error.message });
   }
 });
 
 router.delete("/routes/:id", async (req, res) => {
-  const routes = getRoutes();
-  const index = routes.findIndex((r: any) => r.id === req.params.id);
-  if (index !== -1) {
-    const route = routes[index];
-    routes.splice(index, 1);
-    saveRoutes(routes);
-
-    const confPath = path.join(CONFIG.NGINX_CONF_DIR, `${route.domain}.conf`);
-    if (fs.existsSync(confPath)) fs.unlinkSync(confPath);
-
-    try {
-      await reloadNginx();
-      res.json({ success: true, message: "路由已删除并重载 Nginx" });
-    } catch (error: any) {
-      res.status(500).json({ error: "Nginx 重载失败", details: error.message });
-    }
-  } else {
-    res.status(404).json({ error: "路由未找到" });
+  try {
+    const route = await deleteRoute(req.params.id);
+    res.json({ success: true, route, message: "路由已删除并完成网关重载" });
+  } catch (error: any) {
+    res.status(400).json({ error: "删除路由失败", details: error.message });
   }
 });
 

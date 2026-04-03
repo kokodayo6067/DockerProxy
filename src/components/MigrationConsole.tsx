@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import {
+  EnvironmentSummary,
   MigrationEvent,
   MigrationPlan,
   MigrationProject,
@@ -29,18 +30,11 @@ import {
   MigrationServiceInfo,
   MigrationSession,
 } from '../types';
-import { Badge, Button, Card, Checkbox, Field, Input, Notice, PageHeader, SegmentedTabs, Select, StatCard, Textarea } from './ui/primitives';
+import { Badge, Button, Card, Checkbox, Notice, PageHeader, SegmentedTabs, Select, StatCard } from './ui/primitives';
 
 type MigrationConsoleProps = {
   apiFetch: (url: string, options?: RequestInit) => Promise<Response>;
-};
-
-type TargetHostForm = {
-  host: string;
-  port: string;
-  username: string;
-  password: string;
-  privateKey: string;
+  environments: EnvironmentSummary[];
 };
 
 const PHASES = [
@@ -70,6 +64,20 @@ const riskVariantMap: Record<string, 'default' | 'warning' | 'danger' | 'success
   low: 'default',
   medium: 'warning',
   high: 'danger',
+};
+
+const impactGroupMeta = {
+  'read-only inspect': { title: '只读检查', badge: 'default' as const },
+  'new staging resource': { title: '隔离创建', badge: 'success' as const },
+  'needs cutover': { title: '切换阶段', badge: 'warning' as const },
+  blocked: { title: '阻断项', badge: 'danger' as const },
+};
+
+const impactClassificationLabelMap: Record<string, string> = {
+  'read-only inspect': '只读检查',
+  'new staging resource': '隔离创建',
+  'needs cutover': '切换阶段',
+  blocked: '阻断',
 };
 
 const stateVariantMap: Record<string, 'default' | 'warning' | 'danger' | 'success'> = {
@@ -166,16 +174,6 @@ function riskCounter(plan: MigrationPlan | null) {
   };
 }
 
-function normalizeTargetHost(form: TargetHostForm) {
-  return {
-    host: form.host.trim(),
-    port: Number(form.port || 22),
-    username: form.username.trim(),
-    password: form.password || undefined,
-    privateKey: form.privateKey || undefined,
-  };
-}
-
 function mergeSessionEvent(current: MigrationSession | null, event: MigrationEvent) {
   if (event.type === 'session_summary' && event.meta?.session) {
     return event.meta.session;
@@ -183,17 +181,12 @@ function mergeSessionEvent(current: MigrationSession | null, event: MigrationEve
   return current;
 }
 
-export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
+export function MigrationConsole({ apiFetch, environments }: MigrationConsoleProps) {
   const [projects, setProjects] = useState<MigrationProject[]>([]);
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [activeTab, setActiveTab] = useState<'config' | 'impact' | 'execution' | 'result'>('config');
-  const [form, setForm] = useState<TargetHostForm>({
-    host: '',
-    port: '22',
-    username: 'root',
-    password: '',
-    privateKey: '',
-  });
+  const [sourceEnvironmentId, setSourceEnvironmentId] = useState('');
+  const [targetEnvironmentId, setTargetEnvironmentId] = useState('');
   const [projectPath, setProjectPath] = useState('');
   const [rootService, setRootService] = useState('');
   const [session, setSession] = useState<MigrationSession | null>(null);
@@ -210,6 +203,18 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
   const [autoScroll, setAutoScroll] = useState(true);
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const sourceEnvironment =
+    environments.find((environment) => environment.id === sourceEnvironmentId) ||
+    environments.find((environment) => environment.isLocal) ||
+    null;
+  const targetEnvironment =
+    environments.find((environment) => environment.id === targetEnvironmentId) ||
+    environments.find((environment) => !environment.isLocal && environment.capabilities.modules?.migrateTarget) ||
+    null;
+  const sourceEnvironmentOptions = environments.filter((environment) => environment.capabilities.modules?.docker);
+  const targetEnvironmentOptions = environments.filter(
+    (environment) => environment.capabilities.modules?.migrateTarget && environment.id !== sourceEnvironmentId
+  );
 
   const selectedProjectServices = pickServiceOptions(projects, projectPath);
   const selectedProject = projects.find((project) => project.path === projectPath) || null;
@@ -227,6 +232,19 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
   }));
   const riskRows = getRiskRows(plan);
   const currentPhaseLabel = session?.currentPhase ? PHASES.find((phase) => phase.key === session.currentPhase)?.label || session.currentPhase : '';
+  const sourceDirectoryFailure =
+    (result?.message || '').includes('源服务器项目目录') || (rollbackSummary?.message || '').includes('源服务器项目目录');
+  const autoHandledNetworks = Array.from(
+    new Set(
+      [
+        ...(plan?.readOnlyInspect || []),
+        ...(plan?.needsCutover || []),
+        ...(plan?.stagingResources || []),
+      ]
+        .filter((item) => item.kind === 'network' && item.detail.includes('自动创建'))
+        .map((item) => item.label)
+    )
+  );
 
   const filteredLogs = logs.filter((entry) => {
     if (entry.type === 'heartbeat') return false;
@@ -235,10 +253,24 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
     return true;
   });
 
+  useEffect(() => {
+    if (!sourceEnvironmentId && sourceEnvironmentOptions.length > 0) {
+      setSourceEnvironmentId(sourceEnvironmentOptions[0].id);
+    }
+    if ((!targetEnvironmentId || !targetEnvironmentOptions.some((environment) => environment.id === targetEnvironmentId)) && targetEnvironmentOptions.length > 0) {
+      setTargetEnvironmentId(targetEnvironmentOptions[0].id);
+    }
+  }, [sourceEnvironmentId, sourceEnvironmentOptions, targetEnvironmentId, targetEnvironmentOptions]);
+
   const reloadProjects = async (preferredProjectPath?: string) => {
+    if (!sourceEnvironmentId) {
+      setProjects([]);
+      setLoadingProjects(false);
+      return;
+    }
     setLoadingProjects(true);
     try {
-      const res = await apiFetch('/api/migrate/projects');
+      const res = await apiFetch(`/api/migrate/projects?environmentId=${encodeURIComponent(sourceEnvironmentId)}`);
       const data = await res.json();
       const nextProjects = Array.isArray(data) ? data : [];
       setProjects(nextProjects);
@@ -269,9 +301,11 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
   }, [filteredLogs, autoScroll]);
 
   useEffect(() => {
-    reloadProjects();
+    if (sourceEnvironmentId) {
+      reloadProjects();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiFetch]);
+  }, [apiFetch, sourceEnvironmentId]);
 
   useEffect(() => {
     const options = pickServiceOptions(projects, projectPath);
@@ -331,8 +365,8 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
   }, [apiFetch, session?.id]);
 
   const generatePlan = async () => {
-    if (!projectPath || !effectiveRootService || !form.host.trim() || !form.username.trim()) {
-      setError('请先选择迁移对象，并填写目标机 SSH 信息。');
+    if (!projectPath || !effectiveRootService || !sourceEnvironmentId || !targetEnvironmentId) {
+      setError('请先选择源服务器、迁移对象和目标服务器。');
       return;
     }
 
@@ -347,7 +381,8 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
         body: JSON.stringify({
           projectPath,
           rootService: effectiveRootService,
-          targetHost: normalizeTargetHost(form),
+          sourceEnvironmentId,
+          targetEnvironmentId,
         }),
       });
       const data = await res.json();
@@ -371,8 +406,6 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
     try {
       const res = await apiFetch(`/api/migrate/sessions/${session.id}/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetHost: normalizeTargetHost(form) }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -395,8 +428,6 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
     try {
       const res = await apiFetch(`/api/migrate/sessions/${session.id}/rollback`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetHost: normalizeTargetHost(form) }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -486,8 +517,8 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
 
   const stepGuide = {
     config: {
-      title: '先选择迁移来源和目标主机',
-      description: '选中 Compose 项目或独立容器，填写目标 SSH 信息，然后生成迁移计划。',
+      title: '先选来源，再确认源/目标服务器',
+      description: '系统会自动识别 Compose 整组或独立容器；如果原始目录不可读，会自动降级为运行态快照。',
     },
     impact: {
       title: '确认迁移范围、风险和阻断项',
@@ -570,12 +601,13 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
           <div className="space-y-4 rounded-2xl border border-[color:var(--border-subtle)] bg-[var(--surface-card-strong)] p-5">
             <div className="flex items-center gap-2">
               <Server className="w-4 h-4 text-[var(--brand-500)]" />
-              <p className="font-medium text-[color:var(--text-primary)]">目标主机摘要</p>
+              <p className="font-medium text-[color:var(--text-primary)]">服务器摘要</p>
             </div>
             <div className="space-y-3 text-sm">
-              <SummaryLine label="主机" value={session?.target.host || form.host || '-'} />
-              <SummaryLine label="用户" value={session?.target.username || form.username || '-'} />
-              <SummaryLine label="端口" value={String(session?.target.port || form.port || '-')} />
+              <SummaryLine label="源服务器" value={sourceEnvironment?.displayName || '-'} />
+              <SummaryLine label="目标服务器" value={targetEnvironment?.displayName || session?.target.host || '-'} />
+              <SummaryLine label="目标主机" value={session?.target.host || targetEnvironment?.host || '-'} />
+              <SummaryLine label="SSH 用户" value={session?.target.username || targetEnvironment?.username || '-'} />
               <SummaryLine label="工作目录" value={session?.target.workdir || '/var/lib/docker-proxy-migrate/<sessionId>'} mono />
             </div>
           </div>
@@ -690,7 +722,7 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
                                     {project.planningMode === 'runtime-snapshot' && <Badge variant="warning">运行态快照</Badge>}
                                   </div>
                                   <p className="mt-1 text-xs text-[color:var(--text-tertiary)]">
-                                    {project.runningContainerCount || 0} 个运行容器
+                                    {project.warning || `${project.runningContainerCount || 0} 个运行容器`}
                                   </p>
                                 </div>
                                 {selected && <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-[var(--brand-600)]" />}
@@ -755,17 +787,20 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
                     <div>
                       <p className="font-medium text-[color:var(--text-primary)]">{selectedProject.name}</p>
                       <p className="mt-1 text-xs text-[color:var(--text-tertiary)]">
-                        {selectedProject.sourceType === 'runtime-container'
-                          ? '来自当前独立容器运行态'
-                          : selectedProject.sourceType === 'runtime-compose'
-                            ? '来自当前 Docker 运行态'
-                            : '来自平台管理目录'}
+                        {selectedProject.description ||
+                          (selectedProject.sourceType === 'runtime-container'
+                            ? '来自当前独立容器运行态'
+                            : selectedProject.sourceType === 'runtime-compose'
+                              ? '来自当前 Docker 运行态'
+                              : '来自平台管理目录')}
                       </p>
                     </div>
                     <Badge variant={selectedProject.planningMode === 'runtime-snapshot' ? 'warning' : 'success'}>
                       {selectedProject.planningMode === 'runtime-snapshot' ? '快照来源' : '原始编排'}
                     </Badge>
                   </div>
+
+                  {selectedProject.warning && <Notice tone="warning">{selectedProject.warning}</Notice>}
 
                   {!isComposeSource && selectedProjectServices.length > 1 && (
                     <div className="flex flex-wrap gap-2">
@@ -799,47 +834,51 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
             <div className="space-y-5 rounded-2xl border border-[color:var(--border-subtle)] bg-[var(--surface-card-strong)] p-5">
               <div className="flex items-center gap-2">
                 <Server className="h-4 w-4 text-[var(--brand-500)]" />
-                <p className="font-medium text-[color:var(--text-primary)]">目标主机 SSH</p>
+                <p className="font-medium text-[color:var(--text-primary)]">服务器选择</p>
               </div>
-              <p className="text-sm text-[color:var(--text-tertiary)]">填写目标主机后即可生成迁移计划。</p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <Field label="目标主机" className="md:col-span-2">
-                  <Input
-                    value={form.host}
-                    onChange={(event) => setForm((current) => ({ ...current, host: event.target.value }))}
-                    placeholder="192.168.1.100"
-                  />
-                </Field>
-                <Field label="SSH 端口">
-                  <Input
-                    value={form.port}
-                    onChange={(event) => setForm((current) => ({ ...current, port: event.target.value }))}
-                    placeholder="22"
-                  />
-                </Field>
-                <Field label="SSH 用户">
-                  <Input
-                    value={form.username}
-                    onChange={(event) => setForm((current) => ({ ...current, username: event.target.value }))}
-                    placeholder="root"
-                  />
-                </Field>
-                <Field label="密码" className="md:col-span-2" hint="可选">
-                  <Input
-                    type="password"
-                    value={form.password}
-                    onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))}
-                    placeholder="可选；使用私钥时可留空"
-                  />
-                </Field>
-                <Field label="私钥" className="md:col-span-2" hint="与密码二选一">
-                  <Textarea
-                    value={form.privateKey}
-                    onChange={(event) => setForm((current) => ({ ...current, privateKey: event.target.value }))}
-                    placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-                    className="h-36 font-mono text-sm"
-                  />
-                </Field>
+              <p className="text-sm text-[color:var(--text-tertiary)]">迁移统一复用“接入中心”里的服务器凭据和权限评估，不再单独填写 SSH 表单。</p>
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                  <div className="rounded-2xl border border-[color:var(--border-subtle)] bg-[var(--surface-card)] p-4">
+                    <p className="text-sm font-medium text-[color:var(--text-secondary)]">源服务器</p>
+                    <p className="mt-1 text-xs text-[color:var(--text-tertiary)]">选择工作负载当前所在的服务器。系统会基于该服务器上的容器/Compose 状态生成计划。</p>
+                    <Select className="mt-4" value={sourceEnvironmentId} onChange={(event) => setSourceEnvironmentId(event.target.value)}>
+                      {sourceEnvironmentOptions.map((environment) => (
+                        <option key={environment.id} value={environment.id}>
+                          {environment.displayName} · {environment.host}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="rounded-2xl border border-[color:var(--border-subtle)] bg-[var(--surface-card)] p-4">
+                    <p className="text-sm font-medium text-[color:var(--text-secondary)]">目标服务器</p>
+                    <p className="mt-1 text-xs text-[color:var(--text-tertiary)]">目标服务器需要具备 inspect / operate / elevated 能力，才能完成隔离恢复、切换和回滚。</p>
+                    <Select className="mt-4" value={targetEnvironmentId} onChange={(event) => setTargetEnvironmentId(event.target.value)}>
+                      {targetEnvironmentOptions.map((environment) => (
+                        <option key={environment.id} value={environment.id}>
+                          {environment.displayName} · {environment.host}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                </div>
+                {targetEnvironment ? (
+                  <div className="rounded-2xl border border-[color:var(--border-subtle)] bg-[var(--surface-card)] p-4 text-sm">
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                      <SummaryLine label="目标地址" value={`${targetEnvironment.host}:${targetEnvironment.port}`} />
+                      <SummaryLine label="SSH 用户" value={targetEnvironment.username || '-'} />
+                      <SummaryLine label="工作目录" value={targetEnvironment.workdir} mono />
+                      <SummaryLine label="Sudo 模式" value={targetEnvironment.capabilities.sudoMode} />
+                    </div>
+                    {targetEnvironment.capabilities.warnings.length > 0 && (
+                      <div className="mt-4">
+                        <Notice tone="warning">{targetEnvironment.capabilities.warnings.join('；')}</Notice>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className={emptyPanelClass}>请先在“接入中心”页面添加并校验一个可迁移的远端服务器。</div>
+                )}
               </div>
             </div>
           </div>
@@ -912,20 +951,25 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
                       )}
                     </div>
                   </div>
-                </div>
+              </div>
 
-                <div className="space-y-4">
+              <div className="space-y-4">
+                  {autoHandledNetworks.length > 0 && (
+                    <Notice tone="info">
+                      平台会自动处理这些托管外部网络：{autoHandledNetworks.join('、')}。如果目标机缺失，会在预检阶段自动创建，不需要你手工登录目标机执行。
+                    </Notice>
+                  )}
                   {[
-                    { title: 'Read-Only Inspect', icon: EyeSectionIcon, items: plan?.readOnlyInspect || [] },
-                    { title: 'New Staging Resource', icon: Layers, items: plan?.stagingResources || [] },
-                    { title: 'Needs Cutover', icon: Network, items: plan?.needsCutover || [] },
-                    { title: 'Blocked', icon: Ban, items: plan?.blockedResources || [] },
+                    { key: 'read-only inspect', icon: EyeSectionIcon, items: plan?.readOnlyInspect || [] },
+                    { key: 'new staging resource', icon: Layers, items: plan?.stagingResources || [] },
+                    { key: 'needs cutover', icon: Network, items: plan?.needsCutover || [] },
+                    { key: 'blocked', icon: Ban, items: plan?.blockedResources || [] },
                   ].map((group) => (
-                    <div key={group.title} className={compactPanelClass}>
+                    <div key={group.key} className={compactPanelClass}>
                       <div className="flex items-center gap-2 mb-3">
                         <group.icon className="w-4 h-4 text-[color:var(--text-tertiary)]" />
-                        <p className="font-medium text-[color:var(--text-primary)]">{group.title}</p>
-                        <Badge variant={group.title === 'Blocked' ? 'danger' : group.title === 'Needs Cutover' ? 'warning' : 'default'}>
+                        <p className="font-medium text-[color:var(--text-primary)]">{impactGroupMeta[group.key as keyof typeof impactGroupMeta].title}</p>
+                        <Badge variant={impactGroupMeta[group.key as keyof typeof impactGroupMeta].badge}>
                           {group.items.length}
                         </Badge>
                       </div>
@@ -1272,6 +1316,12 @@ export function MigrationConsole({ apiFetch }: MigrationConsoleProps) {
                 </div>
               </div>
 
+              {sourceDirectoryFailure && (
+                <Notice tone="warning">
+                  当前失败不是目标机问题，而是源服务器上的原始 Compose 目录已不存在或当前 SSH 账号无法读取。处理方式是先刷新“选择来源”，如果系统已自动降级为“运行态快照”，直接按快照来源重新生成计划；如果你需要保留原始 Compose 语义，请先恢复源目录后再重试。
+                </Notice>
+              )}
+
               <div className={panelClass}>
                 <div className="flex items-center gap-2 mb-4">
                   {session?.status === 'completed' ? (
@@ -1429,6 +1479,7 @@ function SummaryLine({ label, value, mono = false }: { label: string; value: str
 }
 
 function ImpactRow({ item }: { item: MigrationResourceImpact }) {
+  const classificationLabel = impactClassificationLabelMap[item.classification] || item.classification;
   return (
     <div className="rounded-lg border border-[color:var(--border-subtle)] bg-[var(--surface-card-strong)] px-4 py-3">
       <div className="flex items-center justify-between gap-3">
@@ -1444,7 +1495,7 @@ function ImpactRow({ item }: { item: MigrationResourceImpact }) {
                   : 'default'
           }
         >
-          {item.classification}
+          {classificationLabel}
         </Badge>
       </div>
       <p className="mt-2 text-sm text-[color:var(--text-tertiary)]">{item.detail}</p>

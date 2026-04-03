@@ -3,11 +3,11 @@ import axios from "axios";
 import yaml from "js-yaml";
 import fs from "fs";
 import path from "path";
-import { exec } from "child_process";
-import { promisify } from "util";
 import { CONFIG } from "../utils/config";
+import { deployComposeToEnvironment } from "../services/runtime";
+import { getEnvironment, getLocalEnvironmentId } from "../services/platform";
+import { appendJobEvent, createJob, updateJob } from "../services/jobs";
 
-const execAsync = promisify(exec);
 const router = Router();
 
 router.get("/dockerhub", async (req, res) => {
@@ -51,33 +51,67 @@ router.get("/dockerhub", async (req, res) => {
 });
 
 router.post("/compose", async (req, res) => {
-  const { name, composeYaml } = req.body;
+  const { name, composeYaml, remarks, environmentId = getLocalEnvironmentId(), serverId } = req.body;
+  const targetId = serverId || environmentId;
   try {
     const config = yaml.load(composeYaml);
-    
-    // Create a directory for the project
-    const projectDir = path.join(CONFIG.DATA_DIR, 'projects', name);
+    const environment = getEnvironment(targetId);
+    await deployComposeToEnvironment(targetId, name, composeYaml, remarks, (req as any).user?.username || "admin");
+    const projectDir = path.join(CONFIG.DATA_DIR, "projects", targetId, name);
     if (!fs.existsSync(projectDir)) {
       fs.mkdirSync(projectDir, { recursive: true });
     }
-    
-    // Save docker-compose.yml
-    const composePath = path.join(projectDir, 'docker-compose.yml');
-    fs.writeFileSync(composePath, composeYaml);
-
-    // Execute docker-compose up -d
-    try {
-      // Create proxy_net if it doesn't exist
-      await execAsync('docker network inspect proxy_net || docker network create proxy_net');
-      
-      // Run docker-compose up -d
-      const { stdout, stderr } = await execAsync(`docker compose -f "${composePath}" -p "${name}" up -d`);
-      res.json({ success: true, message: `成功部署 ${name} 的 Compose 配置`, config, logs: stdout || stderr });
-    } catch (execError: any) {
-      res.status(500).json({ error: "部署失败", details: execError.message || execError.stderr });
-    }
+    res.json({
+      success: true,
+      message: `成功部署 ${name} 到 ${environment.displayName}`,
+      config,
+      environment,
+    });
   } catch (error: any) {
-    res.status(400).json({ error: "无效的 YAML 格式或处理失败", details: error.message });
+    res.status(400).json({ error: "无效的 YAML 格式或部署失败", details: error.message });
+  }
+});
+
+router.post("/jobs", async (req, res) => {
+  const { name, composeYaml, remarks, serverId = getLocalEnvironmentId() } = req.body;
+  const actor = (req as any).user?.username || "admin";
+  const jobId = createJob({
+    kind: "deploy",
+    sourceEnvironmentId: serverId,
+    status: "running",
+    metadata: {
+      name,
+      remarks: remarks || null,
+    },
+  });
+  appendJobEvent(jobId, "info", "plan", `开始部署 ${name} 到服务器 ${serverId}`);
+
+  try {
+    const config = yaml.load(composeYaml);
+    const environment = getEnvironment(serverId);
+    await deployComposeToEnvironment(serverId, name, composeYaml, remarks, actor);
+    updateJob(jobId, "completed", {
+      name,
+      serverId,
+      remarks: remarks || null,
+      config,
+    });
+    appendJobEvent(jobId, "info", "apply", `部署 ${name} 已完成`);
+    res.json({
+      success: true,
+      jobId,
+      environment,
+      message: `成功部署 ${name} 到 ${environment.displayName}`,
+    });
+  } catch (error: any) {
+    updateJob(jobId, "failed", {
+      name,
+      serverId,
+      remarks: remarks || null,
+      error: error.message,
+    });
+    appendJobEvent(jobId, "error", "apply", `部署失败：${error.message}`);
+    res.status(400).json({ error: "部署任务失败", details: error.message, jobId });
   }
 });
 

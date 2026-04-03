@@ -2,15 +2,24 @@ import { Router } from "express";
 import fs from "fs";
 import path from "path";
 import { CONFIG, loadConfig } from "../utils/config";
+import { getDb } from "../db";
 
 const router = Router();
 
 // 获取当前系统配置状态
 router.get("/", (req, res) => {
+  const db = getDb();
+  const environmentCount =
+    (db.prepare("SELECT COUNT(*) AS count FROM environments").get() as { count: number } | undefined)?.count || 0;
+  const providerConnectionCount =
+    (db.prepare("SELECT COUNT(*) AS count FROM integrations WHERE kind = 'dns-provider'").get() as { count: number } | undefined)?.count || 0;
   res.json({
     nginxContainer: CONFIG.NGINX_CONTAINER_NAME,
     certAgentContainer: CONFIG.CERT_AGENT_CONTAINER_NAME,
     vpsIp: CONFIG.VPS_PUBLIC_IP,
+    hasAppMasterKey: !!CONFIG.APP_MASTER_KEY,
+    environmentCount,
+    providerConnectionCount,
     hasCfToken: !!CONFIG.CF_API_TOKEN,
     hasCfZone: !!CONFIG.CF_ZONE_ID,
     cfProxied: CONFIG.CF_PROXIED,
@@ -33,6 +42,7 @@ JWT_SECRET=${CONFIG.JWT_SECRET}
 NGINX_CONTAINER_NAME=${CONFIG.NGINX_CONTAINER_NAME}
 CERT_AGENT_CONTAINER_NAME=${CONFIG.CERT_AGENT_CONTAINER_NAME}
 VPS_PUBLIC_IP=${CONFIG.VPS_PUBLIC_IP}
+APP_MASTER_KEY=${CONFIG.APP_MASTER_KEY}
 CF_API_TOKEN=${CONFIG.CF_API_TOKEN}
 CF_ZONE_ID=${CONFIG.CF_ZONE_ID}
 CF_PROXIED=${CONFIG.CF_PROXIED}

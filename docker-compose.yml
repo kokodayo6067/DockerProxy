@@ -1,7 +1,10 @@
 
 services:
   docker-proxy-platform:
-    build: .
+    build:
+      context: .
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
     container_name: docker-proxy-platform
     restart: unless-stopped
     ports:

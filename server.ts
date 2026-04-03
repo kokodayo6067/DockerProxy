@@ -6,7 +6,10 @@ import morgan from "morgan";
 import cookieParser from "cookie-parser";
 
 import { initConfig } from "./server/utils/config";
+import { initDatabase } from "./server/db";
 import { initNginx } from "./server/services/nginx";
+import { initPlatformData } from "./server/services/platform";
+import { initGatewaysData } from "./server/services/gateways";
 import { authMiddleware } from "./server/utils/auth";
 
 import authRoutes from "./server/routes/auth";
@@ -18,6 +21,12 @@ import certsRoutes from "./server/routes/certs";
 import migrateRoutes from "./server/routes/migrate";
 import deployRoutes from "./server/routes/deploy";
 import monitorRoutes from "./server/routes/monitor";
+import environmentsRoutes from "./server/routes/environments";
+import serversRoutes from "./server/routes/servers";
+import gatewaysRoutes from "./server/routes/gateways";
+import jobsRoutes from "./server/routes/jobs";
+import providerConnectionsRoutes from "./server/routes/provider-connections";
+import workloadsRoutes from "./server/routes/workloads";
 
 async function startServer() {
   const app = express();
@@ -25,6 +34,9 @@ async function startServer() {
 
   // 初始化配置和 Nginx
   initConfig();
+  await initDatabase();
+  await initPlatformData();
+  initGatewaysData();
   initNginx();
 
   // 中间件配置
@@ -40,13 +52,20 @@ async function startServer() {
   app.use("/api", authMiddleware);
   
   app.use("/api/config", configRoutes);
+  app.use("/api/environments", environmentsRoutes);
+  app.use("/api/servers", serversRoutes);
   app.use("/api/docker", dockerRoutes);
+  app.use("/api/workloads", workloadsRoutes);
   app.use("/api/dns", dnsRoutes);
+  app.use("/api/provider-connections", providerConnectionsRoutes);
+  app.use("/api/gateways", gatewaysRoutes);
   app.use("/api/proxy", proxyRoutes);
   app.use("/api/certs", certsRoutes);
+  app.use("/api/certificates", certsRoutes);
   app.use("/api/migrate", migrateRoutes);
   app.use("/api/deploy", deployRoutes);
   app.use("/api/monitor", monitorRoutes);
+  app.use("/api/jobs", jobsRoutes);
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {

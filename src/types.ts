@@ -12,10 +12,13 @@ export interface ContainerInfo {
 
 export interface ProxyRoute {
   id: string;
+  gatewayId?: string;
+  serverId?: string | null;
   domain: string;
   target: string;
   ssl: boolean;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface DNSRecord {
@@ -27,10 +30,93 @@ export interface DNSRecord {
   ttl: number;
 }
 
+export interface DNSProviderConnection {
+  id: string;
+  kind: string;
+  provider: 'cloudflare' | 'gcore';
+  displayName: string;
+  status: string;
+  managedBy: 'database' | 'env' | string;
+  lastVerifiedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  capabilities: {
+    supportsProxyStatus: boolean;
+    recordTypes: string[];
+  };
+}
+
+export interface DNSProviderCatalogItem {
+  key: 'cloudflare' | 'gcore';
+  name: string;
+  supportsProxyStatus: boolean;
+  secretLabel: string;
+  description: string;
+}
+
+export interface DNSZoneSummary {
+  id: string;
+  name: string;
+  status?: string;
+  provider: string;
+}
+
+export interface DNSProviderRecord {
+  id: string;
+  provider: string;
+  name: string;
+  fqdn: string;
+  type: string;
+  content: string;
+  ttl: number;
+  proxied?: boolean;
+  editable: boolean;
+  readOnlyReason?: string;
+  meta?: Record<string, unknown>;
+}
+
+export interface EnvironmentSummary {
+  id: string;
+  displayName: string;
+  type: 'local-docker' | 'remote-ssh-docker';
+  source: 'local-host' | 'manual-ssh' | 'provider-imported';
+  runtimeDriver: string;
+  host: string;
+  port: number;
+  username: string | null;
+  workdir: string;
+  authType: 'password' | 'privateKey' | null;
+  hostFingerprint: string | null;
+  status: 'ready' | 'warning' | 'error' | 'pending';
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+  lastVerifiedAt: string | null;
+  isLocal: boolean;
+  capabilities: {
+    connect: boolean;
+    inspect: boolean;
+    operate: boolean;
+    elevated: boolean;
+    dockerVersion?: string | null;
+    composeVersion?: string | null;
+    architecture?: string | null;
+    availableDiskBytes?: number | null;
+    sudoMode: 'none' | 'passwordless' | 'with-password';
+    permissions: string[];
+    warnings: string[];
+    details: Record<string, unknown>;
+    modules: Record<string, boolean>;
+  };
+}
+
 export interface AppConfig {
   nginxContainer: string;
   certAgentContainer: string;
   vpsIp: string;
+  hasAppMasterKey: boolean;
+  environmentCount: number;
+  providerConnectionCount?: number;
   hasCfToken: boolean;
   hasCfZone: boolean;
   cfProxied: boolean;
@@ -39,10 +125,100 @@ export interface AppConfig {
 }
 
 export interface Certificate {
+  id?: string;
+  gatewayId?: string;
+  serverId?: string | null;
+  gatewayName?: string;
   domain: string;
   issueDate: string;
   expiryDate: string;
   status: 'valid' | 'expired' | 'renewing';
+  routeTarget?: string;
+}
+
+export interface ContainerLogEntry {
+  timestamp: string | null;
+  stream: 'stdout' | 'stderr' | 'combined';
+  message: string;
+  raw: string;
+}
+
+export interface ServerChannel {
+  id: string;
+  kind: 'ssh' | 'tmcp' | 'agent';
+  label: string;
+  status: string;
+  detail: string;
+  fingerprint?: string | null;
+  sudoMode?: string;
+  permissions: string[];
+  available: boolean;
+}
+
+export interface GatewaySummary {
+  id: string;
+  serverId: string | null;
+  displayName: string;
+  kind: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  metadata: Record<string, unknown>;
+  server: {
+    id: string;
+    displayName: string;
+    host: string;
+    status: string;
+  } | null;
+  routeCount: number;
+  certificateCount: number;
+  capabilities: {
+    routeManagement: boolean;
+    certificateManagement: boolean;
+  };
+}
+
+export interface JobSummary {
+  id: string;
+  kind: string;
+  sourceServerId?: string | null;
+  targetServerId?: string | null;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  metadata: Record<string, unknown>;
+  source: 'job' | 'migration';
+}
+
+export interface ServerSummary extends EnvironmentSummary {
+  serverId: string;
+  serverType: 'local-host' | 'manual-ssh' | 'provider-imported' | string;
+  metrics: {
+    cpu: number;
+    memoryPercent: number;
+    diskPercent: number;
+    collector: string;
+    scope: 'host' | 'runtime';
+    warning?: string;
+  } | null;
+  gatewaySummary: {
+    total: number;
+    active: number;
+    certificates: number;
+    routes: number;
+  };
+  workloadSummary: {
+    total: number;
+    running: number;
+    composeProjects: number;
+    standalone: number;
+  };
+  channelSummary: Array<{
+    kind: string;
+    label: string;
+    status: string;
+  }>;
+  lastHeartbeatAt: string | null;
 }
 
 export interface MigrationProject {
@@ -56,6 +232,7 @@ export interface MigrationProject {
   planningMode?: 'compose-file' | 'runtime-snapshot';
   description?: string;
   runningContainerCount?: number;
+  warning?: string;
 }
 
 export interface MigrationBoundaryItem {
@@ -215,6 +392,8 @@ export interface MigrationSession {
   projectName: string;
   projectPath: string;
   composePath: string;
+  sourceEnvironmentId: string;
+  targetEnvironmentId: string;
   rootService: string;
   dependencyServices: string[];
   selectedServices: string[];

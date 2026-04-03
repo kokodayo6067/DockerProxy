@@ -1,43 +1,13 @@
 import si from "systeminformation";
 import { docker } from "./docker";
+import { collectRemoteMonitorSnapshot } from "./runtime";
+import type { RuntimeMonitorSnapshot } from "./runtime";
+import { getEnvironment, getLocalEnvironmentId } from "./platform";
 
 const HELPER_IMAGE = "busybox:1.36.1";
 const CACHE_TTL_MS = 2500;
 
-type MonitorSnapshot = {
-  scope: "host" | "runtime";
-  collector: "docker-host-helper" | "systeminformation";
-  warning?: string;
-  cpu: {
-    manufacturer: string;
-    brand: string;
-    cores: number;
-    load: number;
-  };
-  memory: {
-    total: number;
-    used: number;
-    free: number;
-  };
-  os: {
-    platform: string;
-    distro: string;
-    release: string;
-    uptime: number;
-  };
-  disk: Array<{
-    fs: string;
-    size: number;
-    used: number;
-    use: number;
-    mount: string;
-  }>;
-  network: {
-    latency: number;
-    rx_sec: number;
-    tx_sec: number;
-  };
-};
+type MonitorSnapshot = RuntimeMonitorSnapshot;
 
 type HostRawSnapshot = {
   ts: number;
@@ -342,7 +312,15 @@ async function collectRuntimeSnapshot(): Promise<MonitorSnapshot> {
   };
 }
 
-export async function getMonitorSnapshot(): Promise<MonitorSnapshot> {
+export async function getMonitorSnapshot(environmentId = getLocalEnvironmentId()): Promise<MonitorSnapshot> {
+  if (environmentId !== getLocalEnvironmentId()) {
+    const environment = getEnvironment(environmentId);
+    if (!environment.capabilities.inspect) {
+      throw new Error("当前环境缺少 inspect 权限，无法读取监控信息");
+    }
+    return collectRemoteMonitorSnapshot(environmentId);
+  }
+
   try {
     return await collectHostSnapshotViaDocker();
   } catch {

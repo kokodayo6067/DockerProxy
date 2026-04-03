@@ -1,13 +1,19 @@
 import { Router } from "express";
 import jwt from "jsonwebtoken";
 import { CONFIG } from "../utils/config";
+import { getDb } from "../db";
+import { verifyPassword } from "../services/security";
 
 const router = Router();
 
-router.post("/login", (req, res) => {
+router.post("/login", async (req, res) => {
   const { username, password } = req.body;
-  
-  if (username === CONFIG.ADMIN_USERNAME && password === CONFIG.ADMIN_PASSWORD) {
+  const db = getDb();
+  const user = db
+    .prepare("SELECT id, username, password_hash FROM users WHERE username = ?")
+    .get(username) as { id: string; username: string; password_hash: string } | undefined;
+
+  if (user && (await verifyPassword(password, user.password_hash))) {
     const token = jwt.sign({ username }, CONFIG.JWT_SECRET, { expiresIn: '7d' });
     res.cookie("token", token, { httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000 });
     return res.json({ success: true, token });

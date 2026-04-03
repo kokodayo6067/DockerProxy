@@ -13,7 +13,8 @@ const router = Router();
 
 router.get("/projects", async (_req, res) => {
   try {
-    const projects = await listMigrationProjects();
+    const environmentId = String(_req.query.environmentId || "local");
+    const projects = await listMigrationProjects(environmentId);
     res.json(projects);
   } catch (error: any) {
     res.status(500).json({ error: "获取迁移项目列表失败", details: error.message });
@@ -26,6 +27,15 @@ router.post("/plans", async (req, res) => {
     res.json(session);
   } catch (error: any) {
     res.status(400).json({ error: "生成迁移计划失败", details: error.message });
+  }
+});
+
+router.post("/jobs", async (req, res) => {
+  try {
+    const session = await createMigrationPlan(req.body);
+    res.json(session);
+  } catch (error: any) {
+    res.status(400).json({ error: "创建迁移任务失败", details: error.message });
   }
 });
 
@@ -49,7 +59,7 @@ router.get("/sessions/:id/artifacts", (req, res) => {
 
 router.post("/sessions/:id/start", async (req, res) => {
   try {
-    const session = await startMigrationSession(req.params.id, req.body?.targetHost || req.body);
+    const session = await startMigrationSession(req.params.id);
     res.json(session);
   } catch (error: any) {
     res.status(400).json({ error: "启动迁移失败", details: error.message });
@@ -58,7 +68,7 @@ router.post("/sessions/:id/start", async (req, res) => {
 
 router.post("/sessions/:id/rollback", async (req, res) => {
   try {
-    const session = await rollbackMigrationSession(req.params.id, req.body?.targetHost || req.body);
+    const session = await rollbackMigrationSession(req.params.id);
     res.json(session);
   } catch (error: any) {
     res.status(400).json({ error: "执行回滚失败", details: error.message });

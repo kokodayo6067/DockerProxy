@@ -1,12 +1,12 @@
 # Docker Proxy Platform
 
-一个面向单机 VPS / Linux 宿主机的 Docker 可视化运维平台，提供主机监控、容器管理、Cloudflare DNS 管理、Nginx 路由转发、证书管理，以及服务级 Docker 迁移能力。
+一个面向单管理员多 VPS 场景的 Docker 可视化运维平台，提供环境接入、主机监控、容器管理、DNS 管理、Nginx 路由转发、证书管理，以及服务级 Docker 迁移能力。
 
 当前前端已统一到 `React 19 + Vite 6 + Tailwind CSS 4.2`，重点页面采用统一的控制台组件和明暗主题。
 
 ## 适用场景
 
-- 在一台 Linux 主机上统一管理 Docker 容器、反向代理和 DNS
+- 在一个控制台中统一管理当前宿主机和远端 VPS 的 Docker 环境
 - 快速生成并部署 `docker-compose.yml`
 - 查看宿主机资源，而不仅仅是容器内部指标
 - 将 Compose 项目或独立容器迁移到另一台机器，并保留计划、风险、日志、结果和目标机回滚能力
@@ -15,18 +15,26 @@
 
 ### 1. 主机监控
 
-- 展示 CPU、内存、磁盘、网络延迟和吞吐
+- 支持按环境查看当前宿主机或远端 VPS 的 CPU、内存、磁盘、网络延迟和吞吐
 - 展示最近一段时间的 CPU / 内存趋势
-- 优先采集宿主机视角；如果宿主机 helper 不可用，会回退到当前运行环境视角并给出提示
+- 本机环境优先采集宿主机视角；远端环境通过 SSH 采集 `/proc` 与系统信息
 
 ### 2. 容器管理
 
+- 支持按环境切换容器列表
 - 自动区分 `Compose 项目` 和 `独立容器`
 - Compose 容器按项目折叠展示，独立容器单独展示
 - 支持搜索、状态筛选、分页
 - 支持启动、停止、重启、删除、查看日志
 
-### 3. DNS 代理模块
+### 3. 环境接入
+
+- 自动注册当前宿主机为 `local-docker` 环境
+- 支持新增 `remote-ssh-docker` 环境
+- 支持密码或私钥接入
+- 首次接入会记录主机指纹，并给出 `connect / inspect / operate / elevated` 权限分层结果
+
+### 4. DNS 代理模块
 
 - 对接 Cloudflare DNS 记录
 - 支持域名切换、记录增删改查
@@ -34,21 +42,23 @@
 - 支持分页
 - 如果 Token 没有全局 `Zone:Read` 权限，会自动进入 fallback 模式，并结合 `ALLOWED_DOMAINS + CF_ZONE_ID` 兜底
 
-### 4. 服务快速部署
+### 5. 服务快速部署
 
 - 根据镜像名、服务名、端口等参数生成 Compose 模板
 - 提供在线编辑器，便于手工调整后部署
+- 支持选择部署目标环境
 
-### 5. 路由转发与证书
+### 6. 路由转发与证书
 
 - 管理反向代理规则
 - 管理证书状态与续签动作
 
-### 6. Docker 服务级迁移
+### 7. Docker 服务级迁移
 
 - 支持两类来源：
   - `Compose 项目`：按整个项目整组迁移
   - `独立容器`：按单容器迁移
+- 迁移目标环境来自“环境接入”模块，不再在迁移页重复填写 SSH 凭据
 - 支持迁移计划、影响面、风险与阻断项审查
 - 支持执行进度、服务矩阵、传输进度、命令日志
 - 支持结果查看、导出报告、目标机回滚
@@ -74,7 +84,7 @@
 ## 技术栈
 
 - 前端：React 19、Vite 6、Tailwind CSS 4.2、lucide-react、motion、recharts
-- 后端：Express、Dockerode、node-ssh、jsonwebtoken
+- 后端：Express、Dockerode、node-ssh、better-sqlite3、jsonwebtoken
 - 运行方式：同一个 Node 进程同时提供 API 和前端静态资源
 
 ## 环境要求
@@ -115,6 +125,7 @@ touch .env
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=123456
 JWT_SECRET=change-me
+APP_MASTER_KEY=change-me-too
 NGINX_CONTAINER_NAME=nginx-gateway
 CERT_AGENT_CONTAINER_NAME=cert-agent
 VPS_PUBLIC_IP=
@@ -129,6 +140,7 @@ ALLOWED_DOMAINS=example.com
 
 - 仓库里的 `.env.example` 目前还保留了一些 AI Studio 注释；部署本项目时以上面的实际变量为准。
 - 如果不使用 Cloudflare，可暂时留空 `CF_*` 相关配置。
+- `APP_MASTER_KEY` 用于加密保存 SSH 私钥、密码和后续集成凭据；如果不配置，将无法创建远端环境。
 
 3. 启动
 
@@ -147,6 +159,13 @@ http://localhost:3000
 - `/var/run/docker.sock`：用于管理宿主机 Docker
 - `./data`：用于持久化平台数据
 - `./.env`：用于系统设置读写
+
+当前 `./data` 下会保存：
+
+- `app.db`：平台控制面数据库
+- `projects/`：Compose 项目与部署产物
+- `migrations/`：迁移快照、报告和事件流
+- `nginx/`：Nginx 配置产物
 
 ### 方式二：源码运行
 

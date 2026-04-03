@@ -1,4 +1,5 @@
-FROM node:20-alpine
+ARG NODE_IMAGE=node:20-alpine
+FROM ${NODE_IMAGE}
 
 # 安装 docker 客户端，以便在容器内调用宿主机的 docker
 RUN apk add --no-cache docker-cli
